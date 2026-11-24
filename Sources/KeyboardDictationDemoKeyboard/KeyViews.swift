@@ -376,118 +376,128 @@ final class CandidateGridView: UIView {
     }
 }
 
-// MARK: - Voice overlay
+// MARK: - Voice wave bar
 
-final class VoiceOverlayView: UIView, UIGestureRecognizerDelegate {
-    private let backdrop = UIVisualEffectView(effect: UIBlurEffect(style: .systemThickMaterial))
-    private let ring = UIView()
-    private let micCircle = UIView()
-    private let micIcon = UIImageView(image: UIImage(systemName: "mic.fill", withConfiguration: UIImage.SymbolConfiguration(pointSize: 24, weight: .medium)))
-    let titleLabel = UILabel()
-    let textLabel = UILabel()
-    let hintLabel = UILabel()
-    let cancelButton = KeyButton("取消", style: .function, fontSize: 15)
-    let doneButton = KeyButton("完成", style: .accent, fontSize: 15)
-    var onBackgroundTap: (() -> Void)?
-    private var hint = ""
+/// Replaces the toolbar / candidate bar while dictating: 3 layered sine waves flowing across the
+/// full width, amplitude driven by the live microphone level.
+final class WaveBarView: UIView {
+    private let waves: [CAShapeLayer] = (0..<3).map { _ in CAShapeLayer() }
+    private var link: CADisplayLink?
+    private var phase: CGFloat = 0
+    private var target: CGFloat = 0
+    private var level: CGFloat = 0
+    private var tint: UIColor = .systemBlue
+    /// Small 完成 pill shown in tap-to-talk mode.
+    let doneButton = KeyButton("完成", style: .accent, fontSize: 14)
+    var onTap: (() -> Void)?
+
+    private let specs: [(freq: CGFloat, speed: CGFloat, amp: CGFloat, alpha: CGFloat, width: CGFloat)] = [
+        (1.6, 0.11, 1.0, 0.95, 2.2),
+        (2.3, -0.08, 0.7, 0.55, 1.6),
+        (1.1, 0.06, 0.5, 0.35, 1.2),
+    ]
 
     override init(frame: CGRect) {
         super.init(frame: frame)
-        addSubview(backdrop)
-        ring.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.22)
-        micCircle.backgroundColor = .systemBlue
-        micIcon.tintColor = .white
-        micIcon.contentMode = .center
-        titleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
-        titleLabel.textAlignment = .center
-        titleLabel.textColor = .label
-        textLabel.font = .systemFont(ofSize: 18)
-        textLabel.numberOfLines = 3
-        textLabel.textAlignment = .center
-        textLabel.lineBreakMode = .byTruncatingHead
-        textLabel.textColor = .label
-        hintLabel.font = .systemFont(ofSize: 12)
-        hintLabel.textAlignment = .center
-        hintLabel.textColor = .secondaryLabel
-        for v in [ring, micCircle, micIcon, titleLabel, textLabel, hintLabel, cancelButton, doneButton] as [UIView] {
-            addSubview(v)
+        isUserInteractionEnabled = true
+        for w in waves {
+            w.fillColor = UIColor.clear.cgColor
+            w.lineCap = .round
+            w.lineJoin = .round
+            layer.addSublayer(w)
         }
-        let tap = UITapGestureRecognizer(target: self, action: #selector(backgroundTapped))
-        tap.delegate = self
-        addGestureRecognizer(tap)
+        doneButton.isHidden = true
+        addSubview(doneButton)
+        addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped)))
+        applyTint()
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    @objc private func backgroundTapped() { onBackgroundTap?() }
+    @objc private func tapped() { onTap?() }
 
-    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
-        !(touch.view is UIControl)
-    }
-
-    func showListening(title: String, hint: String, buttons: Bool) {
-        self.hint = hint
-        titleLabel.text = title
-        textLabel.text = ""
-        hintLabel.text = hint
-        hintLabel.textColor = .secondaryLabel
-        micCircle.backgroundColor = .systemBlue
-        ring.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.22)
-        cancelButton.isHidden = !buttons
-        doneButton.isHidden = !buttons
-        ring.transform = .identity
-    }
-
-    func setTitle(_ title: String) { titleLabel.text = title }
-
-    func setButtons(_ visible: Bool, hint: String) {
-        self.hint = hint
-        hintLabel.text = hint
-        cancelButton.isHidden = !visible
-        doneButton.isHidden = !visible
-    }
-
-    func setText(_ text: String) { textLabel.text = text }
-
-    func setCancelArmed(_ armed: Bool) {
-        micCircle.backgroundColor = armed ? .systemRed : .systemBlue
-        ring.backgroundColor = (armed ? UIColor.systemRed : UIColor.systemBlue).withAlphaComponent(0.22)
-        hintLabel.text = armed ? "松开手指，取消输入" : hint
-        hintLabel.textColor = armed ? .systemRed : .secondaryLabel
-    }
-
-    func showRecognizing() {
-        titleLabel.text = "识别中…"
-        hintLabel.text = ""
-        cancelButton.isHidden = true
-        doneButton.isHidden = true
-        ring.transform = .identity
-    }
-
-    func setLevel(_ rms: Float) {
-        let s = 1 + CGFloat(min(rms * 12, 0.8))
-        UIView.animate(withDuration: 0.08, delay: 0, options: [.beginFromCurrentState, .allowUserInteraction]) {
-            self.ring.transform = CGAffineTransform(scaleX: s, y: s)
+    func start() {
+        level = 0
+        target = 0
+        setArmed(false)
+        if link == nil {
+            let l = CADisplayLink(target: self, selector: #selector(step))
+            l.add(to: .main, forMode: .common)
+            link = l
         }
+        isHidden = false
+        redraw()
+    }
+
+    func stop() {
+        link?.invalidate()
+        link = nil
+        isHidden = true
+        doneButton.isHidden = true
+    }
+
+    /// rms is ~0...0.1 for speech.
+    func setLevel(_ rms: Float) {
+        target = min(1, CGFloat(rms) * 14)
+    }
+
+    func setQuiet() { target = 0 }
+
+    func setArmed(_ armed: Bool) {
+        tint = armed ? .systemRed : .systemBlue
+        applyTint()
+    }
+
+    private func applyTint() {
+        for (i, w) in waves.enumerated() {
+            w.strokeColor = tint.withAlphaComponent(specs[i].alpha).cgColor
+            w.lineWidth = specs[i].width
+        }
+    }
+
+    @objc private func step() {
+        // Fast attack, slower release.
+        level += (target - level) * (target > level ? 0.35 : 0.08)
+        target *= 0.97
+        phase += 1
+        redraw()
+    }
+
+    private func redraw() {
+        let w = bounds.width, h = bounds.height
+        guard w > 0, h > 0 else { return }
+        let mid = h / 2
+        let maxAmp = h / 2 - 3
+        let amp = maxAmp * (0.10 + 0.90 * level)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (i, wave) in waves.enumerated() {
+            let spec = specs[i]
+            let path = UIBezierPath()
+            let steps = max(24, Int(w / 4))
+            for s in 0...steps {
+                let x = w * CGFloat(s) / CGFloat(steps)
+                let t = x / w
+                // Taper at both ends so the line flows into the edges.
+                let envelope = sin(t * .pi)
+                let y = mid + sin(t * .pi * 2 * spec.freq + phase * spec.speed + CGFloat(i)) * amp * spec.amp * envelope
+                if s == 0 { path.move(to: CGPoint(x: x, y: y)) } else { path.addLine(to: CGPoint(x: x, y: y)) }
+            }
+            wave.frame = bounds
+            wave.path = path.cgPath
+        }
+        CATransaction.commit()
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        let w = bounds.width, h = bounds.height
-        backdrop.frame = bounds
-        let c = CGPoint(x: w / 2, y: 50)
-        let saved = ring.transform
-        ring.transform = .identity
-        ring.frame = CGRect(x: c.x - 30, y: c.y - 30, width: 60, height: 60)
-        ring.layer.cornerRadius = 30
-        ring.transform = saved
-        micCircle.frame = CGRect(x: c.x - 28, y: c.y - 28, width: 56, height: 56)
-        micCircle.layer.cornerRadius = 28
-        micIcon.frame = micCircle.frame
-        titleLabel.frame = CGRect(x: 16, y: 92, width: w - 32, height: 20)
-        textLabel.frame = CGRect(x: 20, y: 116, width: w - 40, height: max(0, h - 116 - 56))
-        hintLabel.frame = CGRect(x: 110, y: h - 44, width: w - 220, height: 30)
-        cancelButton.frame = CGRect(x: 14, y: h - 50, width: 88, height: 40)
-        doneButton.frame = CGRect(x: w - 102, y: h - 50, width: 88, height: 40)
+        doneButton.frame = CGRect(x: bounds.width - 66, y: (bounds.height - 30) / 2, width: 58, height: 30)
+        doneButton.layer.cornerRadius = 15
+        redraw()
+    }
+
+    override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
+        super.traitCollectionDidChange(previousTraitCollection)
+        applyTint()
     }
 }

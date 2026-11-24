@@ -13,6 +13,7 @@ struct ContentView: View {
     @AppStorage(KeyboardSettings.Key.haptics, store: KeyboardSettings.defaults) private var haptics = true
     @AppStorage(KeyboardSettings.Key.micPrewarm, store: KeyboardSettings.defaults) private var micPrewarm = true
     @AppStorage(KeyboardSettings.Key.onDevice, store: KeyboardSettings.defaults) private var onDevice = false
+    @AppStorage(KeyboardSettings.Key.inlineCompat, store: KeyboardSettings.defaults) private var inlineCompat = false
     @AppStorage(KeyboardSettings.Key.holdDelay, store: KeyboardSettings.defaults) private var holdDelay = 0.2
 
     var body: some View {
@@ -48,6 +49,7 @@ struct ContentView: View {
                     Toggle("按键震动", isOn: $haptics)
                     Toggle("麦克风预热（按下即录）", isOn: $micPrewarm)
                     Toggle("离线识别优先", isOn: $onDevice)
+                    Toggle("语音上屏兼容模式（逐段替换）", isOn: $inlineCompat)
                     Picker("长按空格开始说话", selection: $holdDelay) {
                         Text("0.15 秒").tag(0.15)
                         Text("0.2 秒").tag(0.2)

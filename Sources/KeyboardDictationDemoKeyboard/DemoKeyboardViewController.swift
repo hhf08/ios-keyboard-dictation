@@ -42,6 +42,10 @@ final class DemoKeyboardViewController: UIInputViewController {
     private var cancelArmed = false
     private var micDownAt = Date.distantPast
     private var ignoreMicUp = false
+    // Live inline dictation: the partial text currently in the document.
+    private var inlineText = ""
+    private var inlineMarked = false
+    private var inlineCompatMode = false
 
     // Delete repeat
     private var deleteTimer: Timer?
@@ -64,7 +68,7 @@ final class DemoKeyboardViewController: UIInputViewController {
     private let candidateGrid = CandidateGridView()
     private let clipboardPanel = PageView()
     private let settingsPanel = PageView()
-    private let overlay = VoiceOverlayView()
+    private let waveBar = WaveBarView()
     private let popup = UILabel()
 
     private var spaceKeys: [KeyButton] = []
@@ -89,6 +93,7 @@ final class DemoKeyboardViewController: UIInputViewController {
     private let hapticSwitch = UISwitch()
     private let prewarmSwitch = UISwitch()
     private let onDeviceSwitch = UISwitch()
+    private let inlineCompatSwitch = UISwitch()
     private let layoutSegment = UISegmentedControl(items: ["九键", "全键盘"])
 
     private var isT9: Bool { lang == .chinese && layoutKind == .t9 }
@@ -115,13 +120,12 @@ final class DemoKeyboardViewController: UIInputViewController {
         buildClipboardPanel()
         buildSettingsPanel()
 
-        overlay.isHidden = true
-        overlay.cancelButton.addAction(UIAction { [weak self] _ in self?.cancelVoice() }, for: .touchUpInside)
-        overlay.doneButton.addAction(UIAction { [weak self] _ in self?.stopVoice() }, for: .touchUpInside)
-        overlay.onBackgroundTap = { [weak self] in
+        waveBar.isHidden = true
+        waveBar.doneButton.addAction(UIAction { [weak self] _ in self?.stopVoice() }, for: .touchUpInside)
+        waveBar.onTap = { [weak self] in
             if self?.voiceTrigger == .micToggle { self?.stopVoice() }
         }
-        view.addSubview(overlay)
+        topBar.addSubview(waveBar)
 
         popup.isHidden = true
         popup.textAlignment = .center
@@ -132,12 +136,15 @@ final class DemoKeyboardViewController: UIInputViewController {
         popup.layer.masksToBounds = true
         view.addSubview(popup)
 
-        dictation.onPartial = { [weak self] text in self?.overlay.setText(text) }
-        dictation.onLevel = { [weak self] rms in self?.overlay.setLevel(rms) }
-        dictation.onListening = { [weak self] in
-            guard let self, self.voiceTrigger != .finishing, self.voiceTrigger != .none else { return }
-            self.overlay.setTitle("正在聆听…")
+        dictation.onPartial = { [weak self] text in
+            guard let self, self.voiceTrigger != .none else { return }
+            self.setInline(text)
         }
+        dictation.onLevel = { [weak self] rms in
+            guard let self, self.voiceTrigger != .none, self.voiceTrigger != .finishing else { return }
+            self.waveBar.setLevel(rms)
+        }
+        dictation.onListening = nil
         dictation.onFinish = { [weak self] text in self?.voiceFinished(text) }
         dictation.onFailure = { [weak self] message in self?.showStatus(message, duration: 3.5) }
         dictation.attach(to: view)
@@ -178,8 +185,10 @@ final class DemoKeyboardViewController: UIInputViewController {
         spaceTimer = nil
         deleteUp()
         if voiceTrigger != .none {
+            // Keep whatever was already recognized in the document.
             voiceTrigger = .none
-            overlay.isHidden = true
+            commitInline(inlineText)
+            endWaveBar()
         }
         dictation.cool()
         clearCompose()
@@ -209,8 +218,8 @@ final class DemoKeyboardViewController: UIInputViewController {
         for v in [t9Page, qwertyPage, numberPage, symbolPage, candidatePanel, clipboardPanel, settingsPanel] {
             v.frame = keyArea.bounds
         }
-        overlay.frame = b
-        view.bringSubviewToFront(overlay)
+        waveBar.frame = topBar.bounds
+        topBar.bringSubviewToFront(waveBar)
         view.bringSubviewToFront(popup)
     }
 
@@ -231,6 +240,7 @@ final class DemoKeyboardViewController: UIInputViewController {
         hapticSwitch.isOn = hapticsOn
         prewarmSwitch.isOn = KeyboardSettings.micPrewarm
         onDeviceSwitch.isOn = KeyboardSettings.onDeviceRecognition
+        inlineCompatSwitch.isOn = KeyboardSettings.inlineCompat
         layoutSegment.selectedSegmentIndex = layoutKind == .t9 ? 0 : 1
         layoutToggleButton?.setIcon(layoutKind == .t9 ? "keyboard" : "square.grid.3x3", size: 18)
     }
@@ -336,10 +346,12 @@ final class DemoKeyboardViewController: UIInputViewController {
     }
 
     private func updateTopBar() {
+        let voice = voiceTrigger != .none
         let composing = !compose.isEmpty
-        candidateBar.isHidden = !composing
-        statusLabel.isHidden = composing || !statusVisible
-        toolbar.isHidden = composing || statusVisible
+        waveBar.isHidden = !voice
+        candidateBar.isHidden = voice || !composing
+        statusLabel.isHidden = voice || composing || !statusVisible
+        toolbar.isHidden = voice || composing || statusVisible
     }
 
     private func showStatus(_ text: String, duration: TimeInterval = 2.5) {
@@ -378,7 +390,7 @@ final class DemoKeyboardViewController: UIInputViewController {
         let langKey = makeLangKey()
         let space = makeSpaceKey()
         let ret = makeReturnKey()
-        (digitKeys + [del, clear, zero, sym, num, globe, langKey, space, ret]).forEach { t9Page.addSubview($0) }
+        (digitKeys + [del, clear, zero, sym, num, globe, space, langKey, ret]).forEach { t9Page.addSubview($0) }
         t9Page.layout = { [weak self] v in
             guard let self else { return }
             let m = KeyMetrics(v.bounds)
@@ -391,8 +403,10 @@ final class DemoKeyboardViewController: UIInputViewController {
             }
             sym.frame = CGRect(x: m.inset, y: m.y(3), width: m.side, height: m.rowH)
             ret.frame = CGRect(x: m.rightX, y: m.y(3), width: m.rightW, height: m.rowH)
-            let small = floor(m.key * 0.6)
-            m.distribute([(num as UIView, small), (globe as UIView, small), (langKey as UIView, small), (space as UIView, CGFloat(0))], x: m.centerX(0), width: m.centerSpan, y: m.y(3))
+            // 符号 | 123 [🌐] 空格 中/英 | 换行
+            let small = floor(m.key * 0.62)
+            m.distribute([(num as UIView, small), (globe as UIView, floor(m.key * 0.5)), (space as UIView, CGFloat(0)),
+                          (langKey as UIView, small)], x: m.centerX(0), width: m.centerSpan, y: m.y(3))
         }
     }
 
@@ -433,7 +447,7 @@ final class DemoKeyboardViewController: UIInputViewController {
         }
         let ret = makeReturnKey()
         let shift = shiftKey!, punct = qwertyPunctKey!
-        [shift, del, num, globe, sym, langKey, space, punct, ret].forEach { qwertyPage.addSubview($0) }
+        [shift, del, sym, num, globe, punct, space, langKey, ret].forEach { qwertyPage.addSubview($0) }
         qwertyPage.layout = { v in
             let m = KeyMetrics(v.bounds)
             let usable = v.bounds.width - m.inset * 2
@@ -452,9 +466,10 @@ final class DemoKeyboardViewController: UIInputViewController {
             for (i, k) in rowKeys[2].enumerated() {
                 k.frame = CGRect(x: x2 + CGFloat(i) * (kw + m.gap), y: m.y(2), width: kw, height: m.rowH)
             }
-            m.distribute([(num as UIView, floor(kw * 1.2)), (globe as UIView, kw), (sym as UIView, floor(kw * 1.2)),
-                          (langKey as UIView, floor(kw * 1.2)), (space as UIView, CGFloat(0)), (punct as UIView, kw),
-                          (ret as UIView, floor(kw * 2))],
+            // 符号 123 [🌐] ， 空格 中/英 换行
+            m.distribute([(sym as UIView, floor(kw * 1.25)), (num as UIView, floor(kw * 1.25)), (globe as UIView, kw),
+                          (punct as UIView, kw), (space as UIView, CGFloat(0)), (langKey as UIView, floor(kw * 1.25)),
+                          (ret as UIView, floor(kw * 1.9))],
                          x: m.inset, width: usable, y: m.y(3))
         }
     }
@@ -631,6 +646,11 @@ final class DemoKeyboardViewController: UIInputViewController {
         let hapticLabel = label("按键震动")
         let prewarmLabel = label("麦克风预热（按下即录，状态栏会显示麦克风）")
         let onDeviceLabel = label("离线识别优先（更快，准确率略低）")
+        let inlineLabel = label("语音上屏兼容模式（逐段替换）")
+        inlineCompatSwitch.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            KeyboardSettings.inlineCompat = self.inlineCompatSwitch.isOn
+        }, for: .valueChanged)
         layoutSegment.addAction(UIAction { [weak self] _ in
             guard let self else { return }
             let kind: ChineseLayout = self.layoutSegment.selectedSegmentIndex == 0 ? .t9 : .qwerty
@@ -654,6 +674,7 @@ final class DemoKeyboardViewController: UIInputViewController {
         }, for: .valueChanged)
         let rows: [(UILabel, UIView)] = [
             (layoutLabel, layoutSegment), (hapticLabel, hapticSwitch), (prewarmLabel, prewarmSwitch), (onDeviceLabel, onDeviceSwitch),
+            (inlineLabel, inlineCompatSwitch),
         ]
         ([title, done] as [UIView]).forEach { settingsPanel.addSubview($0) }
         for (l, c) in rows {
@@ -1136,7 +1157,7 @@ final class DemoKeyboardViewController: UIInputViewController {
         let armed = y < -60
         if armed != cancelArmed {
             cancelArmed = armed
-            overlay.setCancelArmed(armed)
+            waveBar.setArmed(armed)
             if armed { tick() }
         }
     }
@@ -1164,7 +1185,7 @@ final class DemoKeyboardViewController: UIInputViewController {
         if Date().timeIntervalSince(micDownAt) < 0.35 {
             // Quick tap: keep listening until 完成 / tap.
             voiceTrigger = .micToggle
-            overlay.setButtons(true, hint: "说完后点「完成」")
+            waveBar.doneButton.isHidden = false
         } else {
             stopVoice()
         }
@@ -1180,33 +1201,43 @@ final class DemoKeyboardViewController: UIInputViewController {
             return
         }
         hidePopup()
+        hidePanels()
+        inlineText = ""
+        inlineMarked = false
+        inlineCompatMode = KeyboardSettings.inlineCompat
         voiceTrigger = trigger
         if hapticsOn {
             startHaptic.impactOccurred()
             startHaptic.prepare()
         }
-        overlay.showListening(title: dictation.isMicWarm ? "正在聆听…" : "正在启动麦克风…",
-                              hint: trigger == .spaceHold ? holdHint : "松开 结束",
-                              buttons: false)
-        overlay.isHidden = false
-        view.bringSubviewToFront(overlay)
+        waveBar.start()
+        updateTopBar()
         if !dictation.begin() {
             voiceTrigger = .none
-            overlay.isHidden = true
+            endWaveBar()
         }
+    }
+
+    private func endWaveBar() {
+        waveBar.stop()
+        updateTopBar()
     }
 
     private func stopVoice() {
         guard voiceTrigger != .none, voiceTrigger != .finishing else { return }
         voiceTrigger = .finishing
-        overlay.showRecognizing()
+        // Listening is over: the wave settles while the final result arrives.
+        waveBar.setQuiet()
+        waveBar.setArmed(false)
+        waveBar.doneButton.isHidden = true
         dictation.end()
     }
 
     private func cancelVoice() {
         guard voiceTrigger != .none else { return }
         voiceTrigger = .none
-        overlay.isHidden = true
+        removeInline()
+        endWaveBar()
         dictation.cancel()
     }
 
@@ -1214,12 +1245,68 @@ final class DemoKeyboardViewController: UIInputViewController {
         let wasActive = voiceTrigger != .none
         voiceTrigger = .none
         cancelArmed = false
-        overlay.isHidden = true
-        guard let text else { return }
+        endWaveBar()
+        guard let text else {
+            removeInline()
+            return
+        }
         if text.isEmpty {
+            removeInline()
             if wasActive { showStatus("没有听清，请再说一次") }
             return
         }
-        textDocumentProxy.insertText(text)
+        commitInline(text)
+    }
+
+    // MARK: - Live inline dictation text
+
+    /// Shows the in-progress recognition directly in the text field, updating it in place.
+    private func setInline(_ text: String) {
+        guard text != inlineText else { return }
+        if inlineCompatMode {
+            replaceInlinePlain(with: text)
+        } else {
+            textDocumentProxy.setMarkedText(text, selectedRange: NSRange(location: (text as NSString).length, length: 0))
+            inlineMarked = true
+        }
+        inlineText = text
+    }
+
+    /// Commits the final text in place of the partial.
+    private func commitInline(_ text: String) {
+        if inlineCompatMode {
+            replaceInlinePlain(with: text)
+        } else if inlineMarked {
+            if text != inlineText {
+                textDocumentProxy.setMarkedText(text, selectedRange: NSRange(location: (text as NSString).length, length: 0))
+            }
+            textDocumentProxy.unmarkText()
+        } else if !text.isEmpty {
+            textDocumentProxy.insertText(text)
+        }
+        inlineText = ""
+        inlineMarked = false
+    }
+
+    /// Removes the partial text (cancel / nothing recognized).
+    private func removeInline() {
+        if inlineCompatMode {
+            replaceInlinePlain(with: "")
+        } else if inlineMarked {
+            textDocumentProxy.setMarkedText("", selectedRange: NSRange(location: 0, length: 0))
+            textDocumentProxy.unmarkText()
+        }
+        inlineText = ""
+        inlineMarked = false
+    }
+
+    /// Fallback: delete only the part of the previous partial that changed, then insert the rest.
+    private func replaceInlinePlain(with text: String) {
+        let old = Array(inlineText), new = Array(text)
+        var common = 0
+        while common < old.count, common < new.count, old[common] == new[common] { common += 1 }
+        for _ in 0..<(old.count - common) { textDocumentProxy.deleteBackward() }
+        if common < new.count { textDocumentProxy.insertText(String(new[common...])) }
+        inlineText = text
     }
 }

@@ -19,6 +19,7 @@ enum KeyboardSettings {
         static let onDevice = "onDeviceRecognition"
         static let holdDelay = "holdDelay"
         static let clipboard = "clipboardHistory"
+        static let inlineCompat = "inlineCompat"
     }
 
     static var defaults: UserDefaults {
@@ -53,6 +54,13 @@ enum KeyboardSettings {
             return v > 0.05 ? v : 0.2
         }
         set { defaults.set(newValue, forKey: Key.holdDelay) }
+    }
+
+    /// Live dictation text: false = marked text updated in place (default);
+    /// true = delete the previous partial and insert the new one (for apps that mishandle marked text).
+    static var inlineCompat: Bool {
+        get { defaults.object(forKey: Key.inlineCompat) as? Bool ?? false }
+        set { defaults.set(newValue, forKey: Key.inlineCompat) }
     }
 
     static var clipboardHistory: [String] {
