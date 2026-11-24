@@ -14,7 +14,7 @@ targets:
   KeyboardDictationDemo:
     type: application
     platform: iOS
-    sources: [Sources/KeyboardDictationDemo]
+    sources: [Sources/KeyboardDictationDemo, Sources/Shared]
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: net.stupidtech.keyboard-dictation-demo
@@ -27,9 +27,10 @@ targets:
   KeyboardDictationDemoKeyboard:
     type: app-extension
     platform: iOS
-    sources: [Sources/KeyboardDictationDemoKeyboard]
+    sources: [Sources/KeyboardDictationDemoKeyboard, Sources/Shared]
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: net.stupidtech.keyboard-dictation-demo.keyboard
         INFOPLIST_FILE: KeyboardInfo.plist
         GENERATE_INFOPLIST_FILE: "NO"
+        CODE_SIGN_ENTITLEMENTS: Keyboard.entitlements

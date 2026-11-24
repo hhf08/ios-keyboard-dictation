@@ -1,589 +1,1225 @@
 import AVFoundation
-import OSLog
 import Speech
 import UIKit
 
-private let log = Logger(subsystem: "net.stupidtech.keyboard-dictation-demo.keyboard", category: "dictation")
-
+/// Baidu-style Chinese keyboard: 九键拼音 / 全键盘拼音 / English QWERTY, number pad, symbols,
+/// toolbar (语音 / 剪贴板 / 键盘切换 / 设置 / 收起) and hold-to-talk dictation without app switching.
 @objc(DemoKeyboardViewController)
 final class DemoKeyboardViewController: UIInputViewController {
-    private let capture = WebAudioCapture()
     private let engine = T9Engine()
+    private let dictation = DictationController()
+    private let lightHaptic = UIImpactFeedbackGenerator(style: .light)
+    private let startHaptic = UIImpactFeedbackGenerator(style: .medium)
 
-    private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN"))
-    private var request: SFSpeechAudioBufferRecognitionRequest?
-    private var task: SFSpeechRecognitionTask?
-    private let audioFormat = AVAudioFormat(
-        commonFormat: .pcmFormatInt16, sampleRate: WebAudioCapture.sampleRate, channels: 1, interleaved: true
-    )!
-    private var insertedPartial = ""
-    private var capturedSamples = 0
-    private var speechError: String?
+    private enum Lang { case chinese, english }
+    private enum Page { case main, number, symbols }
+    private enum Shift { case off, once, locked }
+    private enum VoiceTrigger { case none, spaceHold, micHold, micToggle, finishing }
 
-    // T9 state
-    private enum Mode { case pinyin, number }
-    private var mode: Mode = .pinyin
-    private var digits = ""
+    private static let topBarHeight: CGFloat = 48
+
+    // State
+    private var lang: Lang = .chinese
+    private var page: Page = .main
+    private var layoutKind: ChineseLayout = .t9
+    private var compose = ""
     private var pinyinFilter: String?
     private var candidates: [T9Candidate] = []
+    private var pinyinOptions: [String] = []
+    private var sideShowsPinyin = false
+    private var shift: Shift = .off
+    private var lastShiftTap = Date.distantPast
+    private var lastSpaceTap = Date.distantPast
+    private var candidatesExpanded = false
+    private var hapticsOn = true
+    private var statusToken = 0
+    private var statusVisible = false
+
+    // Voice state
+    private var voiceTrigger: VoiceTrigger = .none
+    private var spaceTimer: Timer?
+    private var spaceHoldFired = false
+    private var cancelArmed = false
+    private var micDownAt = Date.distantPast
+    private var ignoreMicUp = false
+
+    // Delete repeat
+    private var deleteTimer: Timer?
+    private var deleteCount = 0
+    private var deleteWasComposing = false
 
     // Views
+    private var heightConstraint: NSLayoutConstraint!
+    private let topBar = UIView()
+    private let toolbar = PageView()
+    private var layoutToggleButton: KeyButton!
+    private let candidateBar = CandidateBarView()
     private let statusLabel = UILabel()
-    private let pinyinScroll = UIScrollView()
-    private let pinyinStack = UIStackView()
-    private let candidateScroll = UIScrollView()
-    private let candidateStack = UIStackView()
-    private let gridStack = UIStackView()
-    private let symbolPanel = UIView()
-    private var zeroButton: UIButton!
-    private var symbolButton: UIButton!
-    private var spaceHint = "长按空格说话，松开结束"
-    private var modeButton: UIButton!
-    private var spaceButton: UIButton!
-    private var returnButton: UIButton!
-    private var digitKeys: [UIButton] = []
+    private let keyArea = PageView()
+    private let t9Page = PageView()
+    private let qwertyPage = PageView()
+    private let numberPage = PageView()
+    private let symbolPage = PageView()
+    private let candidatePanel = PageView()
+    private let candidateGrid = CandidateGridView()
+    private let clipboardPanel = PageView()
+    private let settingsPanel = PageView()
+    private let overlay = VoiceOverlayView()
+    private let popup = UILabel()
+
+    private var spaceKeys: [KeyButton] = []
+    private var returnKeys: [KeyButton] = []
+    private var langKeys: [KeyButton] = []
+    private var globeKeys: [KeyButton] = []
+
+    private let t9Side = SideListView()
+    private var letterKeys: [(Character, KeyButton)] = []
+    private var shiftKey: KeyButton!
+    private var qwertyPunctKey: KeyButton!
+    private let numberSide = SideListView()
+    private let symbolSide = SideListView()
+    private let symbolScroll = TouchScrollView()
+    private var symbolTabKeys: [KeyButton] = []
+    private var symbolKeys: [KeyButton] = []
+    private var symbolTab = 0
+    private var symbolCategory = 0
+
+    private let clipScroll = TouchScrollView()
+    private var clipRows: [UIView] = []
+    private let hapticSwitch = UISwitch()
+    private let prewarmSwitch = UISwitch()
+    private let onDeviceSwitch = UISwitch()
+    private let layoutSegment = UISegmentedControl(items: ["九键", "全键盘"])
+
+    private var isT9: Bool { lang == .chinese && layoutKind == .t9 }
+    private var isFullPinyin: Bool { lang == .chinese && layoutKind == .qwerty }
+
+    // MARK: - Lifecycle
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        configureView()
-        capture.onReady = { [weak self] in self?.render() }
-        capture.onStarted = { [weak self] in self?.setStatus("正在聆听…") }
-        capture.onAudio = { [weak self] data, rms in self?.append(data, rms: rms) }
-        capture.onEnded = { [weak self] reason in self?.captureEnded(reason) }
-        capture.attach(to: view)
-        setStatus("词库加载中…")
-        engine.loadAsync { [weak self] in
-            self?.setStatus("")
-            self?.refreshCandidates()
+        view.backgroundColor = KBColor.background
+        view.isMultipleTouchEnabled = true
+        heightConstraint = view.heightAnchor.constraint(equalToConstant: 266)
+        heightConstraint.priority = UILayoutPriority(999)
+        heightConstraint.isActive = true
+
+        KeyButton.onPress = { [weak self] in self?.tick() }
+
+        buildTopBar()
+        buildT9Page()
+        buildQwertyPage()
+        buildNumberPage()
+        buildSymbolPage()
+        buildCandidatePanel()
+        buildClipboardPanel()
+        buildSettingsPanel()
+
+        overlay.isHidden = true
+        overlay.cancelButton.addAction(UIAction { [weak self] _ in self?.cancelVoice() }, for: .touchUpInside)
+        overlay.doneButton.addAction(UIAction { [weak self] _ in self?.stopVoice() }, for: .touchUpInside)
+        overlay.onBackgroundTap = { [weak self] in
+            if self?.voiceTrigger == .micToggle { self?.stopVoice() }
         }
-        render()
+        view.addSubview(overlay)
+
+        popup.isHidden = true
+        popup.textAlignment = .center
+        popup.font = .systemFont(ofSize: 30)
+        popup.textColor = .label
+        popup.backgroundColor = KBColor.popup
+        popup.layer.cornerRadius = 8
+        popup.layer.masksToBounds = true
+        view.addSubview(popup)
+
+        dictation.onPartial = { [weak self] text in self?.overlay.setText(text) }
+        dictation.onLevel = { [weak self] rms in self?.overlay.setLevel(rms) }
+        dictation.onListening = { [weak self] in
+            guard let self, self.voiceTrigger != .finishing, self.voiceTrigger != .none else { return }
+            self.overlay.setTitle("正在聆听…")
+        }
+        dictation.onFinish = { [weak self] text in self?.voiceFinished(text) }
+        dictation.onFailure = { [weak self] message in self?.showStatus(message, duration: 3.5) }
+        dictation.attach(to: view)
+
+        showStatus("词库加载中…", duration: 10)
+        engine.loadAsync { [weak self] in
+            guard let self else { return }
+            self.statusVisible = false
+            self.refresh()
+        }
+        applySettings()
+        showPage(.main)
+        refresh()
+    }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        applySettings()
+        applyAppearance()
+        lightHaptic.prepare()
+        startHaptic.prepare()
+        // Pre-warm: recognizer task, and (optionally) the microphone stream, before the first press.
+        dictation.prewarm(hasFullAccess: hasFullAccess, micWarm: KeyboardSettings.micPrewarm, onDevice: KeyboardSettings.onDeviceRecognition)
+        updateGlobeKeys()
+        refresh()
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        // Bottom-row keys otherwise get their touch-down delayed by the system edge gesture.
+        view.window?.gestureRecognizers?.forEach { $0.delaysTouchesBegan = false }
+        updateGlobeKeys()
     }
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        if capture.isCapturing { stopDictation() }
+        spaceTimer?.invalidate()
+        spaceTimer = nil
+        deleteUp()
+        if voiceTrigger != .none {
+            voiceTrigger = .none
+            overlay.isHidden = true
+        }
+        dictation.cool()
+        clearCompose()
+        hidePanels()
     }
 
     deinit {
-        MainActor.assumeIsolated { capture.tearDown() }
+        MainActor.assumeIsolated { dictation.capture.tearDown() }
     }
 
-    // MARK: - Dictation
-
-    @objc private func toggleDictation() {
-        capture.isCapturing ? stopDictation() : startDictation()
+    override func viewWillLayoutSubviews() {
+        super.viewWillLayoutSubviews()
+        let screen = UIScreen.main.bounds
+        let target: CGFloat = screen.width > screen.height ? 206 : 266
+        if heightConstraint.constant != target { heightConstraint.constant = target }
     }
 
-    private func startDictation() {
-        guard hasFullAccess else {
-            return setStatus("请在设置中为此键盘打开「允许完全访问」。")
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        let b = view.bounds
+        let top = Self.topBarHeight
+        topBar.frame = CGRect(x: 0, y: 0, width: b.width, height: top)
+        toolbar.frame = topBar.bounds
+        candidateBar.frame = topBar.bounds
+        statusLabel.frame = topBar.bounds.insetBy(dx: 12, dy: 0)
+        keyArea.frame = CGRect(x: 0, y: top + 2, width: b.width, height: max(0, b.height - top - 2))
+        for v in [t9Page, qwertyPage, numberPage, symbolPage, candidatePanel, clipboardPanel, settingsPanel] {
+            v.frame = keyArea.bounds
         }
-        guard AVAudioSession.sharedInstance().recordPermission == .granted else {
-            return setStatus("请打开「语音键盘」App 授予麦克风权限。")
-        }
-        guard SFSpeechRecognizer.authorizationStatus() == .authorized else {
-            return setStatus("请打开「语音键盘」App 授予语音识别权限。")
-        }
-        guard let recognizer, recognizer.isAvailable else {
-            return setStatus("语音识别暂时不可用。")
-        }
-
-        let request = SFSpeechAudioBufferRecognitionRequest()
-        request.shouldReportPartialResults = true
-        request.addsPunctuation = true
-        self.request = request
-        insertedPartial = ""
-        capturedSamples = 0
-        speechError = nil
-        task = recognizer.recognitionTask(with: request) { [weak self] result, error in
-            DispatchQueue.main.async { self?.handle(result: result, error: error) }
-        }
-        capture.start()
-        setStatus("正在启动麦克风…")
-        render()
+        overlay.frame = b
+        view.bringSubviewToFront(overlay)
+        view.bringSubviewToFront(popup)
     }
 
-    private func stopDictation() {
-        capture.stop()
+    override func textDidChange(_ textInput: UITextInput?) {
+        super.textDidChange(textInput)
+        applyAppearance()
+        updateReturnKeys()
     }
 
-    private func captureEnded(_ reason: String) {
-        log.info("capture ended: \(reason, privacy: .public)")
-        log.info("captured \(self.capturedSamples) samples")
-        request?.endAudio()
-        if request == nil {
-            finishRecognition(status: speechError.map { String(format: "已录音 %.1f 秒。识别：%@", Double(capturedSamples) / WebAudioCapture.sampleRate, $0) } ?? "完成。")
+    private func applySettings() {
+        hapticsOn = KeyboardSettings.haptics
+        let newLayout = KeyboardSettings.layout
+        if newLayout != layoutKind {
+            layoutKind = newLayout
+            clearCompose()
+            if page == .main { showPage(.main) }
         }
-        if reason != "stopped" { setStatus(reason) }
-        render()
+        hapticSwitch.isOn = hapticsOn
+        prewarmSwitch.isOn = KeyboardSettings.micPrewarm
+        onDeviceSwitch.isOn = KeyboardSettings.onDeviceRecognition
+        layoutSegment.selectedSegmentIndex = layoutKind == .t9 ? 0 : 1
+        layoutToggleButton?.setIcon(layoutKind == .t9 ? "keyboard" : "square.grid.3x3", size: 18)
     }
 
-    private func append(_ data: Data, rms: Float) {
-        let frames = AVAudioFrameCount(data.count / 2)
-        guard frames > 0 else { return }
-        capturedSamples += Int(frames)
-        let seconds = Double(capturedSamples) / WebAudioCapture.sampleRate
-        let level = String(repeating: "▮", count: min(Int(rms * 60), 10))
-        setStatus(String(format: "录音 %.1f 秒 %@", seconds, level) + (speechError.map { " · 识别：\($0)" } ?? ""))
-        spaceButton.alpha = 0.6 + CGFloat(min(rms * 8, 0.4))
+    private func applyAppearance() {
+        let appearance = textDocumentProxy.keyboardAppearance ?? .default
+        view.overrideUserInterfaceStyle = appearance == .dark ? .dark : .unspecified
+    }
 
-        guard let request, let buffer = AVAudioPCMBuffer(pcmFormat: audioFormat, frameCapacity: frames) else { return }
-        buffer.frameLength = frames
-        data.withUnsafeBytes { raw in
-            buffer.int16ChannelData![0].update(from: raw.bindMemory(to: Int16.self).baseAddress!, count: Int(frames))
+    private func tick() {
+        guard hapticsOn else { return }
+        lightHaptic.impactOccurred()
+        lightHaptic.prepare()
+    }
+
+    // MARK: - Key factories
+
+    private func makeKey(_ title: String, sub: String? = nil, icon: String? = nil, style: KeyButton.Style = .char,
+                         size: CGFloat = 18, _ action: @escaping () -> Void) -> KeyButton {
+        let b = KeyButton(title, sub: sub, icon: icon, style: style, fontSize: size)
+        b.addAction(UIAction { _ in action() }, for: .touchUpInside)
+        return b
+    }
+
+    private func makeDeleteKey() -> KeyButton {
+        let b = KeyButton("", icon: "delete.left", style: .function, iconSize: 18)
+        b.addAction(UIAction { [weak self] _ in self?.deleteDown() }, for: .touchDown)
+        b.addAction(UIAction { [weak self] _ in self?.deleteUp() }, for: [.touchUpInside, .touchUpOutside, .touchCancel])
+        return b
+    }
+
+    private func makeSpaceKey() -> KeyButton {
+        let b = KeyButton("空格", icon: "mic", style: .char, fontSize: 16, iconSize: 12)
+        b.addAction(UIAction { [weak self] _ in self?.spaceDown() }, for: .touchDown)
+        b.addAction(UIAction { [weak self] _ in self?.spaceUp(inside: true) }, for: .touchUpInside)
+        b.addAction(UIAction { [weak self] _ in self?.spaceUp(inside: false) }, for: [.touchUpOutside, .touchCancel])
+        b.onTrack = { [weak self, weak b] touch in
+            guard let self, let b else { return }
+            self.spaceTracked(touch.location(in: b).y)
         }
-        request.append(buffer)
+        spaceKeys.append(b)
+        return b
     }
 
-    private func handle(result: SFSpeechRecognitionResult?, error: Error?) {
-        if let result {
-            replacePartial(with: result.bestTranscription.formattedString)
-            if result.isFinal {
-                                finishRecognition(status: "已输入。")
+    private func makeReturnKey() -> KeyButton {
+        let b = makeKey("换行", style: .function, size: 16) { [weak self] in self?.tapReturn() }
+        returnKeys.append(b)
+        return b
+    }
+
+    private func makeLangKey() -> KeyButton {
+        let b = makeKey("", style: .function, size: 16) { [weak self] in self?.toggleLang() }
+        b.keepsTitleColors = true
+        langKeys.append(b)
+        return b
+    }
+
+    private func makeGlobeKey() -> KeyButton {
+        let b = KeyButton("", icon: "globe", style: .function, iconSize: 18)
+        b.addTarget(self, action: #selector(handleInputModeList(from:with:)), for: .allTouchEvents)
+        globeKeys.append(b)
+        return b
+    }
+
+    // MARK: - Top bar
+
+    private func buildTopBar() {
+        view.addSubview(topBar)
+        view.addSubview(keyArea)
+        keyArea.isMultipleTouchEnabled = true
+
+        statusLabel.font = .systemFont(ofSize: 14)
+        statusLabel.textColor = .secondaryLabel
+        statusLabel.textAlignment = .center
+        statusLabel.numberOfLines = 2
+        statusLabel.adjustsFontSizeToFitWidth = true
+        statusLabel.minimumScaleFactor = 0.7
+
+        let mic = KeyButton("", icon: "mic", style: .plain, iconSize: 19)
+        mic.addAction(UIAction { [weak self] _ in self?.micDown() }, for: .touchDown)
+        mic.addAction(UIAction { [weak self] _ in self?.micUp() }, for: [.touchUpInside, .touchUpOutside, .touchCancel])
+        let clip = makeKey("", icon: "doc.on.clipboard", style: .plain) { [weak self] in self?.toggleClipboard() }
+        layoutToggleButton = makeKey("", icon: "keyboard", style: .plain) { [weak self] in self?.toggleLayout() }
+        let gear = makeKey("", icon: "gearshape", style: .plain) { [weak self] in self?.toggleSettings() }
+        let hide = makeKey("", icon: "keyboard.chevron.compact.down", style: .plain) { [weak self] in self?.dismissKeyboard() }
+        let buttons = [mic, clip, layoutToggleButton!, gear, hide]
+        buttons.forEach { toolbar.addSubview($0) }
+        toolbar.layout = { v in
+            let slot = v.bounds.width / CGFloat(buttons.count)
+            for (i, b) in buttons.enumerated() {
+                b.frame = CGRect(x: slot * CGFloat(i) + (slot - 48) / 2, y: 4, width: 48, height: v.bounds.height - 8)
+                b.layer.cornerRadius = 8
             }
-        } else if let error {
-            log.error("recognition error: \(error.localizedDescription, privacy: .public)")
-            if capture.isCapturing {
-                // Keep capturing so the WebKit audio path stays observable even if Speech fails.
-                speechError = error.localizedDescription
-                task = nil
-                request = nil
+        }
+
+        candidateBar.onSelect = { [weak self] i in
+            guard let self, i < self.candidates.count else { return }
+            self.commit(self.candidates[i])
+        }
+        candidateBar.expandButton.addAction(UIAction { [weak self] _ in self?.toggleExpanded() }, for: .touchUpInside)
+
+        for v in [toolbar, candidateBar, statusLabel] as [UIView] { topBar.addSubview(v) }
+    }
+
+    private func updateTopBar() {
+        let composing = !compose.isEmpty
+        candidateBar.isHidden = !composing
+        statusLabel.isHidden = composing || !statusVisible
+        toolbar.isHidden = composing || statusVisible
+    }
+
+    private func showStatus(_ text: String, duration: TimeInterval = 2.5) {
+        statusToken += 1
+        let token = statusToken
+        statusLabel.text = text
+        statusVisible = true
+        updateTopBar()
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
+            guard let self, self.statusToken == token else { return }
+            self.statusVisible = false
+            self.updateTopBar()
+        }
+    }
+
+    // MARK: - Pages
+
+    private func buildT9Page() {
+        keyArea.addSubview(t9Page)
+        t9Side.onSelect = { [weak self] i in self?.sideSelected(i) }
+        t9Page.addSubview(t9Side)
+        let digitKeys: [KeyButton] = (1...9).map { n in
+            let d = Character(String(n))
+            if n == 1 {
+                return makeKey("分词", sub: "1", size: 16) { [weak self] in self?.tapT9Separator() }
+            }
+            let letters = (T9Engine.letters[d] ?? "").uppercased()
+            return makeKey(letters, sub: String(n), size: 19) { [weak self] in self?.tapT9(d) }
+        }
+        let del = makeDeleteKey()
+        let clear = makeKey("重输", style: .function, size: 16) { [weak self] in self?.clearCompose() }
+        let zero = makeKey("0", style: .function, size: 19) { [weak self] in self?.insertPunctuation("0") }
+        let sym = makeKey("符号", style: .function, size: 15) { [weak self] in self?.showPage(.symbols) }
+        let num = makeKey("123", style: .function, size: 15) { [weak self] in self?.showPage(.number) }
+        let globe = makeGlobeKey()
+        let langKey = makeLangKey()
+        let space = makeSpaceKey()
+        let ret = makeReturnKey()
+        (digitKeys + [del, clear, zero, sym, num, globe, langKey, space, ret]).forEach { t9Page.addSubview($0) }
+        t9Page.layout = { [weak self] v in
+            guard let self else { return }
+            let m = KeyMetrics(v.bounds)
+            self.t9Side.frame = CGRect(x: m.inset, y: 0, width: m.side, height: m.threeRows)
+            for (i, k) in digitKeys.enumerated() {
+                k.frame = CGRect(x: m.centerX(i % 3), y: m.y(i / 3), width: m.key, height: m.rowH)
+            }
+            for (r, k) in [del, clear, zero].enumerated() {
+                k.frame = CGRect(x: m.rightX, y: m.y(r), width: m.rightW, height: m.rowH)
+            }
+            sym.frame = CGRect(x: m.inset, y: m.y(3), width: m.side, height: m.rowH)
+            ret.frame = CGRect(x: m.rightX, y: m.y(3), width: m.rightW, height: m.rowH)
+            let small = floor(m.key * 0.6)
+            m.distribute([(num as UIView, small), (globe as UIView, small), (langKey as UIView, small), (space as UIView, CGFloat(0))], x: m.centerX(0), width: m.centerSpan, y: m.y(3))
+        }
+    }
+
+    private func buildQwertyPage() {
+        keyArea.addSubview(qwertyPage)
+        let rows = ["qwertyuiop", "asdfghjkl", "zxcvbnm"]
+        var rowKeys: [[KeyButton]] = []
+        for r in rows {
+            var keys: [KeyButton] = []
+            for ch in r {
+                let b = KeyButton(String(ch), style: .char, fontSize: 22)
+                b.titleLabel.adjustsFontSizeToFitWidth = false
+                b.addAction(UIAction { [weak self, weak b] _ in
+                    if let b { self?.showPopup(for: b) }
+                }, for: .touchDown)
+                b.addAction(UIAction { [weak self] _ in
+                    self?.hidePopup()
+                    self?.tapLetter(ch)
+                }, for: .touchUpInside)
+                b.addAction(UIAction { [weak self] _ in self?.hidePopup() }, for: [.touchUpOutside, .touchCancel, .touchDragExit])
+                letterKeys.append((ch, b))
+                keys.append(b)
+                qwertyPage.addSubview(b)
+            }
+            rowKeys.append(keys)
+        }
+        shiftKey = KeyButton("", icon: "shift", style: .function, fontSize: 14, iconSize: 18)
+        shiftKey.addAction(UIAction { [weak self] _ in self?.tapShift() }, for: .touchDown)
+        let del = makeDeleteKey()
+        let num = makeKey("123", style: .function, size: 15) { [weak self] in self?.showPage(.number) }
+        let globe = makeGlobeKey()
+        let sym = makeKey("符号", style: .function, size: 15) { [weak self] in self?.showPage(.symbols) }
+        let langKey = makeLangKey()
+        let space = makeSpaceKey()
+        qwertyPunctKey = makeKey("，", style: .char, size: 19) { [weak self] in
+            guard let self else { return }
+            self.insertPunctuation(self.lang == .english ? "," : "，")
+        }
+        let ret = makeReturnKey()
+        let shift = shiftKey!, punct = qwertyPunctKey!
+        [shift, del, num, globe, sym, langKey, space, punct, ret].forEach { qwertyPage.addSubview($0) }
+        qwertyPage.layout = { v in
+            let m = KeyMetrics(v.bounds)
+            let usable = v.bounds.width - m.inset * 2
+            let kw = floor((usable - m.gap * 9) / 10)
+            for (i, k) in rowKeys[0].enumerated() {
+                k.frame = CGRect(x: m.inset + CGFloat(i) * (kw + m.gap), y: m.y(0), width: kw, height: m.rowH)
+            }
+            let x1 = m.inset + (usable - (kw * 9 + m.gap * 8)) / 2
+            for (i, k) in rowKeys[1].enumerated() {
+                k.frame = CGRect(x: x1 + CGFloat(i) * (kw + m.gap), y: m.y(1), width: kw, height: m.rowH)
+            }
+            let wide = floor(kw * 1.35)
+            shift.frame = CGRect(x: m.inset, y: m.y(2), width: wide, height: m.rowH)
+            del.frame = CGRect(x: v.bounds.width - m.inset - wide, y: m.y(2), width: wide, height: m.rowH)
+            let x2 = m.inset + (usable - (kw * 7 + m.gap * 6)) / 2
+            for (i, k) in rowKeys[2].enumerated() {
+                k.frame = CGRect(x: x2 + CGFloat(i) * (kw + m.gap), y: m.y(2), width: kw, height: m.rowH)
+            }
+            m.distribute([(num as UIView, floor(kw * 1.2)), (globe as UIView, kw), (sym as UIView, floor(kw * 1.2)),
+                          (langKey as UIView, floor(kw * 1.2)), (space as UIView, CGFloat(0)), (punct as UIView, kw),
+                          (ret as UIView, floor(kw * 2))],
+                         x: m.inset, width: usable, y: m.y(3))
+        }
+    }
+
+    private func buildNumberPage() {
+        keyArea.addSubview(numberPage)
+        numberSide.setItems(SymbolData.numberSide)
+        numberSide.onSelect = { [weak self] i in self?.insertPunctuation(SymbolData.numberSide[i]) }
+        numberPage.addSubview(numberSide)
+        let digitKeys: [KeyButton] = (1...9).map { n in
+            makeKey(String(n), size: 24) { [weak self] in self?.insertPunctuation(String(n)) }
+        }
+        let del = makeDeleteKey()
+        let at = makeKey("@", style: .function, size: 20) { [weak self] in self?.insertPunctuation("@") }
+        let dot = makeKey(".", style: .function, size: 24) { [weak self] in self?.insertPunctuation(".") }
+        let back = makeKey("返回", style: .function, size: 15) { [weak self] in self?.showPage(.main) }
+        let sym = makeKey("符号", style: .function, size: 15) { [weak self] in self?.showPage(.symbols) }
+        let zero = makeKey("0", size: 24) { [weak self] in self?.insertPunctuation("0") }
+        let space = makeSpaceKey()
+        let ret = makeReturnKey()
+        (digitKeys + [del, at, dot, back, sym, zero, space, ret]).forEach { numberPage.addSubview($0) }
+        numberPage.layout = { [weak self] v in
+            guard let self else { return }
+            let m = KeyMetrics(v.bounds)
+            self.numberSide.frame = CGRect(x: m.inset, y: 0, width: m.side, height: m.threeRows)
+            for (i, k) in digitKeys.enumerated() {
+                k.frame = CGRect(x: m.centerX(i % 3), y: m.y(i / 3), width: m.key, height: m.rowH)
+            }
+            for (r, k) in [del, at, dot].enumerated() {
+                k.frame = CGRect(x: m.rightX, y: m.y(r), width: m.rightW, height: m.rowH)
+            }
+            back.frame = CGRect(x: m.inset, y: m.y(3), width: m.side, height: m.rowH)
+            for (c, k) in [sym, zero, space].enumerated() {
+                k.frame = CGRect(x: m.centerX(c), y: m.y(3), width: m.key, height: m.rowH)
+            }
+            ret.frame = CGRect(x: m.rightX, y: m.y(3), width: m.rightW, height: m.rowH)
+        }
+    }
+
+    private func buildSymbolPage() {
+        keyArea.addSubview(symbolPage)
+        symbolSide.onSelect = { [weak self] i in self?.selectSymbolCategory(i) }
+        symbolScroll.alwaysBounceVertical = true
+        symbolPage.addSubview(symbolSide)
+        symbolPage.addSubview(symbolScroll)
+        let back = makeKey("返回", style: .function, size: 15) { [weak self] in self?.showPage(.main) }
+        symbolTabKeys = SymbolData.tabs.enumerated().map { i, tab in
+            makeKey(tab.name, style: .function, size: 15) { [weak self] in self?.selectSymbolTab(i) }
+        }
+        let del = makeDeleteKey()
+        let tabs = symbolTabKeys
+        ([back, del] + tabs).forEach { symbolPage.addSubview($0) }
+        symbolPage.layout = { [weak self] v in
+            guard let self else { return }
+            let m = KeyMetrics(v.bounds)
+            self.symbolSide.frame = CGRect(x: m.inset, y: 0, width: m.side, height: m.threeRows)
+            self.symbolScroll.frame = CGRect(x: m.centerX(0), y: 0, width: v.bounds.width - m.inset - m.centerX(0), height: m.threeRows)
+            self.layoutSymbolGrid(rowHeight: floor((m.threeRows - m.gap * 2) / 3), gap: m.gap)
+            back.frame = CGRect(x: m.inset, y: m.y(3), width: m.side, height: m.rowH)
+            m.distribute(tabs.map { ($0 as UIView, CGFloat(0)) }, x: m.centerX(0), width: m.centerSpan, y: m.y(3))
+            del.frame = CGRect(x: m.rightX, y: m.y(3), width: m.rightW, height: m.rowH)
+        }
+        selectSymbolTab(0)
+    }
+
+    private func selectSymbolTab(_ index: Int) {
+        symbolTab = index
+        for (i, k) in symbolTabKeys.enumerated() { k.isSelectedState = i == index }
+        selectSymbolCategory(0)
+    }
+
+    private func selectSymbolCategory(_ index: Int) {
+        let tab = SymbolData.tabs[symbolTab]
+        symbolCategory = min(index, tab.categories.count - 1)
+        symbolSide.setItems(tab.categories.map(\.name), selected: symbolCategory)
+        symbolKeys.forEach { $0.removeFromSuperview() }
+        symbolKeys = tab.categories[symbolCategory].items.map { s in
+            let b = makeKey(s, size: s.count > 2 ? 14 : 20) { [weak self] in self?.insertSymbolText(s) }
+            symbolScroll.addSubview(b)
+            return b
+        }
+        symbolScroll.contentOffset = .zero
+        symbolPage.setNeedsLayout()
+    }
+
+    private func layoutSymbolGrid(rowHeight: CGFloat, gap: CGFloat) {
+        let width = symbolScroll.bounds.width
+        let long = symbolKeys.contains { ($0.titleLabel.text ?? "").count > 3 }
+        let cols: CGFloat = long ? 3 : 6
+        let w = floor((width - gap * (cols - 1)) / cols)
+        for (i, k) in symbolKeys.enumerated() {
+            let r = CGFloat(i / Int(cols)), c = CGFloat(i % Int(cols))
+            k.frame = CGRect(x: c * (w + gap), y: r * (rowHeight + gap), width: w, height: rowHeight)
+        }
+        let rows = ceil(CGFloat(symbolKeys.count) / cols)
+        symbolScroll.contentSize = CGSize(width: width, height: max(0, rows * (rowHeight + gap) - gap))
+    }
+
+    private func buildCandidatePanel() {
+        keyArea.addSubview(candidatePanel)
+        candidatePanel.backgroundColor = KBColor.background
+        candidatePanel.isHidden = true
+        candidateGrid.onSelect = { [weak self] i in
+            guard let self, i < self.candidates.count else { return }
+            self.commit(self.candidates[i])
+        }
+        let back = KeyButton("", icon: "chevron.up", style: .function, iconSize: 18)
+        back.addAction(UIAction { [weak self] _ in self?.toggleExpanded() }, for: .touchUpInside)
+        let del = makeDeleteKey()
+        let clear = makeKey("重输", style: .function, size: 16) { [weak self] in self?.clearCompose() }
+        let grid = candidateGrid
+        [grid, back, del, clear].forEach { candidatePanel.addSubview($0) }
+        candidatePanel.layout = { v in
+            let m = KeyMetrics(v.bounds)
+            grid.frame = CGRect(x: m.inset, y: 0, width: m.rightX - m.gap - m.inset, height: v.bounds.height - 4)
+            let h = floor((v.bounds.height - 4 - m.gap * 2) / 3)
+            for (i, k) in [back, del, clear].enumerated() {
+                k.frame = CGRect(x: m.rightX, y: CGFloat(i) * (h + m.gap), width: m.rightW, height: h)
+            }
+        }
+    }
+
+    private func buildClipboardPanel() {
+        keyArea.addSubview(clipboardPanel)
+        clipboardPanel.backgroundColor = KBColor.background
+        clipboardPanel.isHidden = true
+        let title = UILabel()
+        title.text = "剪贴板"
+        title.font = .systemFont(ofSize: 15, weight: .semibold)
+        title.textColor = .label
+        let clear = makeKey("清空", style: .function, size: 14) { [weak self] in
+            KeyboardSettings.clipboardHistory = []
+            self?.reloadClipboardRows()
+        }
+        let close = makeKey("关闭", style: .function, size: 14) { [weak self] in self?.hidePanels() }
+        clipScroll.alwaysBounceVertical = true
+        [title, clear, close, clipScroll].forEach { clipboardPanel.addSubview($0) }
+        clipboardPanel.layout = { [weak self] v in
+            guard let self else { return }
+            let w = v.bounds.width
+            title.frame = CGRect(x: 12, y: 0, width: 120, height: 32)
+            close.frame = CGRect(x: w - 4 - 60, y: 2, width: 60, height: 28)
+            clear.frame = CGRect(x: w - 4 - 60 - 8 - 60, y: 2, width: 60, height: 28)
+            self.clipScroll.frame = CGRect(x: 4, y: 38, width: w - 8, height: v.bounds.height - 42)
+            var y: CGFloat = 0
+            for row in self.clipRows {
+                let h: CGFloat = row is KeyButton ? 48 : 60
+                row.frame = CGRect(x: 0, y: y, width: w - 8, height: h)
+                y += h + 6
+            }
+            self.clipScroll.contentSize = CGSize(width: w - 8, height: y)
+        }
+    }
+
+    private func buildSettingsPanel() {
+        keyArea.addSubview(settingsPanel)
+        settingsPanel.backgroundColor = KBColor.background
+        settingsPanel.isHidden = true
+        let title = UILabel()
+        title.text = "键盘设置"
+        title.font = .systemFont(ofSize: 15, weight: .semibold)
+        title.textColor = .label
+        let done = makeKey("完成", style: .accent, size: 14) { [weak self] in self?.hidePanels() }
+        func label(_ text: String) -> UILabel {
+            let l = UILabel()
+            l.text = text
+            l.font = .systemFont(ofSize: 15)
+            l.textColor = .label
+            l.adjustsFontSizeToFitWidth = true
+            l.minimumScaleFactor = 0.7
+            return l
+        }
+        let layoutLabel = label("中文键盘布局")
+        let hapticLabel = label("按键震动")
+        let prewarmLabel = label("麦克风预热（按下即录，状态栏会显示麦克风）")
+        let onDeviceLabel = label("离线识别优先（更快，准确率略低）")
+        layoutSegment.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            let kind: ChineseLayout = self.layoutSegment.selectedSegmentIndex == 0 ? .t9 : .qwerty
+            KeyboardSettings.layout = kind
+            self.applySettings()
+        }, for: .valueChanged)
+        hapticSwitch.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            KeyboardSettings.haptics = self.hapticSwitch.isOn
+            self.hapticsOn = self.hapticSwitch.isOn
+        }, for: .valueChanged)
+        prewarmSwitch.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            KeyboardSettings.micPrewarm = self.prewarmSwitch.isOn
+            self.dictation.prewarm(hasFullAccess: self.hasFullAccess, micWarm: self.prewarmSwitch.isOn, onDevice: KeyboardSettings.onDeviceRecognition)
+        }, for: .valueChanged)
+        onDeviceSwitch.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            KeyboardSettings.onDeviceRecognition = self.onDeviceSwitch.isOn
+            self.dictation.prewarm(hasFullAccess: self.hasFullAccess, micWarm: KeyboardSettings.micPrewarm, onDevice: self.onDeviceSwitch.isOn)
+        }, for: .valueChanged)
+        let rows: [(UILabel, UIView)] = [
+            (layoutLabel, layoutSegment), (hapticLabel, hapticSwitch), (prewarmLabel, prewarmSwitch), (onDeviceLabel, onDeviceSwitch),
+        ]
+        ([title, done] as [UIView]).forEach { settingsPanel.addSubview($0) }
+        for (l, c) in rows {
+            settingsPanel.addSubview(l)
+            settingsPanel.addSubview(c)
+        }
+        settingsPanel.layout = { v in
+            let w = v.bounds.width
+            title.frame = CGRect(x: 12, y: 0, width: 160, height: 32)
+            done.frame = CGRect(x: w - 4 - 60, y: 2, width: 60, height: 28)
+            let rowH = max(36, floor((v.bounds.height - 40) / CGFloat(rows.count)))
+            for (i, (l, c)) in rows.enumerated() {
+                let y = 38 + CGFloat(i) * rowH
+                let cw: CGFloat = c is UISegmentedControl ? 150 : 51
+                let ch: CGFloat = c is UISegmentedControl ? 30 : 31
+                c.frame = CGRect(x: w - 12 - cw, y: y + (rowH - ch) / 2, width: cw, height: ch)
+                l.frame = CGRect(x: 14, y: y, width: w - 40 - cw, height: rowH)
+            }
+        }
+    }
+
+    private func showPage(_ newPage: Page) {
+        if newPage != .main { commitAll() }
+        hidePanels()
+        page = newPage
+        t9Page.isHidden = !(page == .main && isT9)
+        qwertyPage.isHidden = !(page == .main && !isT9)
+        numberPage.isHidden = page != .number
+        symbolPage.isHidden = page != .symbols
+        if page == .symbols, lang == .english, symbolTab == 0 { selectSymbolTab(1) }
+        updateLetterKeys()
+        updateLangKeys()
+        updateReturnKeys()
+        refresh()
+    }
+
+    private func hidePanels() {
+        clipboardPanel.isHidden = true
+        settingsPanel.isHidden = true
+        candidatesExpanded = false
+        candidatePanel.isHidden = true
+        candidateBar.expandButton.setIcon("chevron.down", size: 16)
+    }
+
+    private func updateGlobeKeys() {
+        let needed = needsInputModeSwitchKey
+        for g in globeKeys { g.isHidden = !needed }
+        [t9Page, qwertyPage].forEach { $0.setNeedsLayout() }
+    }
+
+    // MARK: - Key label updates
+
+    private func updateLetterKeys() {
+        let upper = lang == .english && shift != .off
+        for (ch, b) in letterKeys {
+            b.setTitle(upper ? String(ch).uppercased() : String(ch))
+        }
+        if lang == .chinese {
+            shiftKey.setIcon(nil)
+            shiftKey.setTitle("分词")
+            shiftKey.isSelectedState = false
+        } else {
+            shiftKey.setTitle("")
+            switch shift {
+            case .off: shiftKey.setIcon("shift", size: 18)
+            case .once: shiftKey.setIcon("shift.fill", size: 18)
+            case .locked: shiftKey.setIcon("capslock.fill", size: 18)
+            }
+            shiftKey.isSelectedState = shift != .off
+        }
+        qwertyPunctKey.setTitle(lang == .english ? "," : "，")
+    }
+
+    private func updateLangKeys() {
+        let zh = lang == .chinese
+        let s = NSMutableAttributedString(string: "中", attributes: [
+            .font: UIFont.systemFont(ofSize: zh ? 17 : 12, weight: zh ? .semibold : .regular),
+            .foregroundColor: zh ? UIColor.label : UIColor.secondaryLabel,
+        ])
+        s.append(NSAttributedString(string: "/", attributes: [.font: UIFont.systemFont(ofSize: 12), .foregroundColor: UIColor.secondaryLabel]))
+        s.append(NSAttributedString(string: "英", attributes: [
+            .font: UIFont.systemFont(ofSize: zh ? 12 : 17, weight: zh ? .regular : .semibold),
+            .foregroundColor: zh ? UIColor.secondaryLabel : UIColor.label,
+        ]))
+        for k in langKeys {
+            k.titleLabel.attributedText = s
+            k.setNeedsLayout()
+        }
+    }
+
+    private func returnTitle() -> (String, Bool) {
+        if !compose.isEmpty { return ("确认", false) }
+        switch textDocumentProxy.returnKeyType ?? .default {
+        case .send: return ("发送", true)
+        case .search, .google, .yahoo: return ("搜索", true)
+        case .go, .route: return ("前往", true)
+        case .done: return ("完成", true)
+        case .next: return ("下一项", true)
+        case .join: return ("加入", true)
+        case .emergencyCall: return ("紧急呼叫", true)
+        default: return ("换行", false)
+        }
+    }
+
+    private func updateReturnKeys() {
+        let (title, accent) = returnTitle()
+        for k in returnKeys {
+            k.setTitle(title)
+            k.style = accent ? .accent : .function
+        }
+    }
+
+    // MARK: - Composition
+
+    private func refresh() {
+        if compose.isEmpty {
+            candidates = []
+            pinyinOptions = []
+            pinyinFilter = nil
+            if candidatesExpanded { hidePanels() }
+        } else if engine.isLoaded {
+            candidates = engine.candidates(input: compose, fullPinyin: isFullPinyin, pinyinFilter: isT9 ? pinyinFilter : nil)
+            pinyinOptions = isT9 ? engine.pinyinOptions(input: compose) : []
+        }
+        candidateBar.compositionLabel.text = compositionText()
+        candidateBar.setCandidates(candidates.prefix(60).map(\.text))
+        if candidatesExpanded { candidateGrid.setItems(candidates.map(\.text)) }
+        if isT9 {
+            if compose.isEmpty {
+                if sideShowsPinyin || t9SideNeedsInit {
+                    t9SideNeedsInit = false
+                    sideShowsPinyin = false
+                    t9Side.setItems(SymbolData.quickChinese)
+                }
             } else {
-                finishRecognition(status: speechError.map { "识别：\($0)" } ?? "完成。")
+                sideShowsPinyin = true
+                t9Side.setItems(pinyinOptions, selected: pinyinFilter.flatMap { pinyinOptions.firstIndex(of: $0) })
             }
+        }
+        updateTopBar()
+        updateReturnKeys()
+    }
+
+    private var t9SideNeedsInit = true
+
+    private func compositionText() -> String {
+        guard !compose.isEmpty else { return "" }
+        let keyCount = T9Engine.keyCount(compose)
+        if isT9 {
+            let base = pinyinFilter ?? pinyinOptions.first ?? ""
+            let used = base.filter { $0 != "'" }.count
+            let digits = compose.filter { $0 != "'" }
+            if used < keyCount {
+                let rest = String(digits.dropFirst(used).compactMap { T9Engine.letters[$0]?.first })
+                return base.isEmpty ? rest : base + "'" + rest
+            }
+            return base
+        }
+        if let c = candidates.first {
+            if c.consumed >= keyCount { return c.pinyin }
+            return c.pinyin + "'" + T9Engine.drop(keys: c.consumed, from: compose)
+        }
+        return compose
+    }
+
+    private func sideSelected(_ i: Int) {
+        if sideShowsPinyin {
+            guard i < pinyinOptions.count else { return }
+            let option = pinyinOptions[i]
+            pinyinFilter = pinyinFilter == option ? nil : option
+            refresh()
+        } else if i < SymbolData.quickChinese.count {
+            insertPunctuation(SymbolData.quickChinese[i])
         }
     }
 
-    private func replacePartial(with text: String) {
-        guard text != insertedPartial else { return }
-        // Only rewrite the suffix that changed to minimise flicker in the host field.
-        let common = zip(insertedPartial, text).prefix { $0 == $1 }.count
-        for _ in 0..<(insertedPartial.count - common) { textDocumentProxy.deleteBackward() }
-        textDocumentProxy.insertText(String(text.dropFirst(common)))
-        insertedPartial = text
+    private func tapT9(_ digit: Character) {
+        guard T9Engine.keyCount(compose) < 30 else { return }
+        compose.append(digit)
+        pinyinFilter = nil
+        refresh()
     }
 
-
-    private func finishRecognition(status: String) {
-        task = nil
-        request = nil
-        insertedPartial = ""
-        setStatus(status)
-        render()
+    private func tapT9Separator() {
+        if compose.isEmpty {
+            insertPunctuation("、")
+        } else if compose.last != "'" {
+            compose.append("'")
+            refresh()
+        }
     }
 
-    // MARK: - T9 input
-
-    private func tapDigit(_ d: Character) {
-        if mode == .number {
-            textDocumentProxy.insertText(String(d))
+    private func tapLetter(_ letter: Character) {
+        if lang == .english {
+            textDocumentProxy.insertText(shift != .off ? String(letter).uppercased() : String(letter))
+            if shift == .once {
+                shift = .off
+                updateLetterKeys()
+            }
             return
         }
-        guard digits.count < 24 else { return }
-        digits.append(d)
-        pinyinFilter = nil
-        refreshCandidates()
+        guard T9Engine.keyCount(compose) < 40 else { return }
+        compose.append(letter)
+        refresh()
     }
 
-    private func tapDelete() {
-        if !digits.isEmpty {
-            digits.removeLast()
+    private func tapShift() {
+        if lang == .chinese {
+            if !compose.isEmpty, compose.last != "'" {
+                compose.append("'")
+                refresh()
+            }
+            return
+        }
+        let now = Date()
+        switch shift {
+        case .off: shift = .once
+        case .once: shift = now.timeIntervalSince(lastShiftTap) < 0.35 ? .locked : .off
+        case .locked: shift = .off
+        }
+        lastShiftTap = now
+        updateLetterKeys()
+    }
+
+    private func deleteOnce() {
+        if !compose.isEmpty {
+            compose.removeLast()
             pinyinFilter = nil
-            refreshCandidates()
+            refresh()
         } else {
             textDocumentProxy.deleteBackward()
         }
     }
 
-    private func clearComposition() {
-        digits = ""
+    private func deleteDown() {
+        deleteWasComposing = !compose.isEmpty
+        deleteCount = 0
+        deleteOnce()
+        deleteTimer?.invalidate()
+        let timer = Timer(timeInterval: 0.45, target: self, selector: #selector(deleteRepeatStart), userInfo: nil, repeats: false)
+        RunLoop.main.add(timer, forMode: .common)
+        deleteTimer = timer
+    }
+
+    @objc private func deleteRepeatStart() {
+        let timer = Timer(timeInterval: 0.07, target: self, selector: #selector(deleteRepeatTick), userInfo: nil, repeats: true)
+        RunLoop.main.add(timer, forMode: .common)
+        deleteTimer = timer
+        deleteRepeatTick()
+    }
+
+    @objc private func deleteRepeatTick() {
+        if deleteWasComposing, compose.isEmpty {
+            deleteUp()
+            return
+        }
+        deleteCount += 1
+        deleteOnce()
+        if deleteCount % 3 == 0 { tick() }
+    }
+
+    private func deleteUp() {
+        deleteTimer?.invalidate()
+        deleteTimer = nil
+    }
+
+    private func clearCompose() {
+        compose = ""
         pinyinFilter = nil
-        refreshCandidates()
+        refresh()
     }
 
     private func commit(_ candidate: T9Candidate) {
         textDocumentProxy.insertText(candidate.text)
-        digits = String(digits.dropFirst(candidate.consumed))
+        compose = T9Engine.drop(keys: candidate.consumed, from: compose)
         pinyinFilter = nil
-        refreshCandidates()
+        refresh()
     }
 
-    private func tapSpace() {
-        if !digits.isEmpty {
-            if let first = candidates.first { commit(first) } else { clearComposition() }
+    /// Commits the raw letters of the composition (回车 while composing).
+    private func commitRaw() {
+        let text: String
+        if isT9 {
+            let spelled = compositionText()
+            text = spelled.replacingOccurrences(of: "'", with: "")
         } else {
-            textDocumentProxy.insertText(" ")
+            text = compose.replacingOccurrences(of: "'", with: "")
+        }
+        textDocumentProxy.insertText(text)
+        clearCompose()
+    }
+
+    /// Commits the best candidates for the whole composition.
+    private func commitAll() {
+        var guardCount = 0
+        while !compose.isEmpty, guardCount < 12 {
+            guardCount += 1
+            if let first = candidates.first { commit(first) } else { commitRaw() }
         }
     }
 
-    private func tapReturn() {
-        if !digits.isEmpty {
-            let letters = pinyinFilter?.replacingOccurrences(of: "'", with: "")
-                ?? engine.pinyinOptions(for: digits).first?.replacingOccurrences(of: "'", with: "")
-                ?? digits
-            textDocumentProxy.insertText(letters)
-            clearComposition()
-        } else {
-            textDocumentProxy.insertText("\n")
-        }
-    }
-
-    private func insertSymbol(_ s: String) {
-        if !digits.isEmpty, let first = candidates.first { commit(first) }
+    private func insertPunctuation(_ s: String) {
+        commitAll()
         textDocumentProxy.insertText(s)
     }
 
-    private func toggleMode() {
-        if !digits.isEmpty { clearComposition() }
-        mode = mode == .pinyin ? .number : .pinyin
-        updateKeyLabels()
+    private func insertSymbolText(_ s: String) {
+        textDocumentProxy.insertText(s)
     }
 
-    private func refreshCandidates() {
-        candidates = engine.isLoaded ? engine.candidates(for: digits, pinyinFilter: pinyinFilter) : []
-        rebuildPinyinBar()
-        rebuildCandidateBar()
-        if !capture.isCapturing { spaceButton?.setTitle(digits.isEmpty ? "空格" : "确定", for: .normal) }
-        if digits.isEmpty, statusLabel.text?.isEmpty ?? true { setStatus(spaceHint) }
-        returnButton?.setTitle(digits.isEmpty ? "换行" : "英文", for: .normal)
+    private func tapSpace() {
+        if !compose.isEmpty {
+            if let first = candidates.first { commit(first) } else { commitRaw() }
+            return
+        }
+        let now = Date()
+        if lang == .english, now.timeIntervalSince(lastSpaceTap) < 0.35,
+           let before = textDocumentProxy.documentContextBeforeInput, before.hasSuffix(" "),
+           let prev = before.dropLast().last, prev.isLetter || prev.isNumber {
+            textDocumentProxy.deleteBackward()
+            textDocumentProxy.insertText(". ")
+            lastSpaceTap = .distantPast
+            return
+        }
+        lastSpaceTap = now
+        textDocumentProxy.insertText(" ")
     }
 
-    private func rebuildPinyinBar() {
-        pinyinStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        let showPinyin = !digits.isEmpty
-        pinyinScroll.isHidden = !showPinyin
-        statusLabel.isHidden = showPinyin
-        guard showPinyin else { return }
-        let options = engine.isLoaded ? engine.pinyinOptions(for: digits) : []
-        for option in options {
-            let b = UIButton(type: .system)
-            b.setTitle(option, for: .normal)
-            b.titleLabel?.font = .systemFont(ofSize: 15, weight: option == pinyinFilter ? .bold : .regular)
-            b.setTitleColor(option == pinyinFilter ? .systemBlue : .label, for: .normal)
-            b.contentEdgeInsets = UIEdgeInsets(top: 0, left: 6, bottom: 0, right: 6)
-            b.addAction(UIAction { [weak self] _ in
-                guard let self else { return }
-                self.pinyinFilter = self.pinyinFilter == option ? nil : option
-                self.refreshCandidates()
-            }, for: .touchUpInside)
-            pinyinStack.addArrangedSubview(b)
+    private func tapReturn() {
+        if !compose.isEmpty {
+            commitRaw()
+            return
+        }
+        textDocumentProxy.insertText("\n")
+    }
+
+    private func toggleLang() {
+        if !compose.isEmpty { commitRaw() }
+        lang = lang == .chinese ? .english : .chinese
+        shift = .off
+        showPage(.main)
+    }
+
+    private func toggleLayout() {
+        clearCompose()
+        KeyboardSettings.layout = layoutKind == .t9 ? .qwerty : .t9
+        applySettings()
+        lang = .chinese
+        showPage(.main)
+        showStatus(layoutKind == .t9 ? "已切换到 九键拼音" : "已切换到 全键盘拼音", duration: 1.2)
+    }
+
+    private func toggleExpanded() {
+        guard !compose.isEmpty || candidatesExpanded else { return }
+        candidatesExpanded.toggle()
+        candidatePanel.isHidden = !candidatesExpanded
+        candidateBar.expandButton.setIcon(candidatesExpanded ? "chevron.up" : "chevron.down", size: 16)
+        if candidatesExpanded {
+            candidateGrid.setItems(candidates.map(\.text))
+            keyArea.bringSubviewToFront(candidatePanel)
         }
     }
 
-    private func rebuildCandidateBar() {
-        candidateStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        candidateScroll.setContentOffset(.zero, animated: false)
-        for (i, c) in candidates.prefix(80).enumerated() {
-            let b = UIButton(type: .system)
-            b.setTitle(c.text, for: .normal)
-            b.titleLabel?.font = .systemFont(ofSize: 20, weight: i == 0 ? .semibold : .regular)
-            b.setTitleColor(i == 0 ? .systemBlue : .label, for: .normal)
-            b.contentEdgeInsets = UIEdgeInsets(top: 0, left: 10, bottom: 0, right: 10)
-            b.addAction(UIAction { [weak self] _ in self?.commit(c) }, for: .touchUpInside)
-            candidateStack.addArrangedSubview(b)
+    // MARK: - Popups
+
+    private func showPopup(for key: KeyButton) {
+        let f = key.convert(key.bounds, to: view)
+        let w = f.width + 14
+        let h = f.height + 10
+        var y = f.minY - h + 4
+        if y < 0 { y = 0 }
+        popup.text = key.titleLabel.text
+        popup.frame = CGRect(x: f.midX - w / 2, y: y, width: w, height: h)
+        popup.isHidden = false
+        view.bringSubviewToFront(popup)
+    }
+
+    private func hidePopup() {
+        popup.isHidden = true
+    }
+
+    // MARK: - Clipboard & settings panels
+
+    private func toggleClipboard() {
+        if !clipboardPanel.isHidden {
+            hidePanels()
+            return
         }
-    }
-
-    // MARK: - UI
-
-    private let keyLetters: [(Character, String)] = [
-        ("1", "、"), ("2", "ABC"), ("3", "DEF"),
-        ("4", "GHI"), ("5", "JKL"), ("6", "MNO"),
-        ("7", "PQRS"), ("8", "TUV"), ("9", "WXYZ"),
-    ]
-
-    private func makeKey(_ title: String, dark: Bool = false, font: UIFont = .systemFont(ofSize: 18), action: @escaping () -> Void) -> UIButton {
-        let b = UIButton(type: .system)
-        b.setTitle(title, for: .normal)
-        b.titleLabel?.font = font
-        b.titleLabel?.numberOfLines = 2
-        b.titleLabel?.textAlignment = .center
-        b.setTitleColor(.label, for: .normal)
-        b.backgroundColor = dark ? UIColor.systemGray3 : UIColor.systemBackground
-        b.layer.cornerRadius = 6
-        b.layer.shadowColor = UIColor.black.cgColor
-        b.layer.shadowOpacity = 0.25
-        b.layer.shadowOffset = CGSize(width: 0, height: 1)
-        b.layer.shadowRadius = 0
-        b.addAction(UIAction { _ in action() }, for: .touchUpInside)
-        return b
-    }
-
-    private func column(_ views: [UIView]) -> UIStackView {
-        let s = UIStackView(arrangedSubviews: views)
-        s.axis = .vertical
-        s.distribution = .fillEqually
-        s.spacing = 6
-        return s
-    }
-
-    private func row(_ views: [UIView], equal: Bool = true) -> UIStackView {
-        let s = UIStackView(arrangedSubviews: views)
-        s.axis = .horizontal
-        s.distribution = equal ? .fillEqually : .fill
-        s.spacing = 6
-        return s
-    }
-
-    private func configureView() {
-        let height = view.heightAnchor.constraint(equalToConstant: 290)
-        height.priority = .defaultHigh
-        height.isActive = true
-
-        statusLabel.font = .systemFont(ofSize: 13)
-        statusLabel.textColor = .secondaryLabel
-        statusLabel.numberOfLines = 1
-
-        pinyinStack.axis = .horizontal
-        pinyinStack.spacing = 2
-        pinyinScroll.showsHorizontalScrollIndicator = false
-        pinyinScroll.addSubview(pinyinStack)
-        candidateStack.axis = .horizontal
-        candidateStack.spacing = 2
-        candidateScroll.showsHorizontalScrollIndicator = false
-        candidateScroll.addSubview(candidateStack)
-
-        // Left: punctuation + mode switch
-        modeButton = makeKey("123", dark: true, font: .systemFont(ofSize: 15)) { [weak self] in self?.toggleMode() }
-        let left = column(["，", "。", "？"].map { s in
-            makeKey(s, dark: true) { [weak self] in self?.insertSymbol(s) }
-        } + [modeButton!] as [UIView])
-
-        // Middle: 3x3 + 0
-        var rows: [UIView] = []
-        for r in 0..<3 {
-            var keys: [UIView] = []
-            for c in 0..<3 {
-                let (d, _) = keyLetters[r * 3 + c]
-                let b = makeKey("", font: .systemFont(ofSize: 17)) { [weak self] in
-                    guard let self else { return }
-                    if d == "1" && self.mode == .pinyin { self.insertSymbol("、") } else { self.tapDigit(d) }
-                }
-                digitKeys.append(b)
-                keys.append(b)
-            }
-            rows.append(row(keys))
+        hidePanels()
+        if hasFullAccess, UIPasteboard.general.hasStrings, let s = UIPasteboard.general.string,
+           !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            var history = KeyboardSettings.clipboardHistory
+            history.removeAll { $0 == s }
+            history.insert(s, at: 0)
+            KeyboardSettings.clipboardHistory = history
         }
-        let zeroKey = makeKey("0") { [weak self] in self?.textDocumentProxy.insertText("0") }
-        zeroButton = zeroKey
-        symbolButton = makeKey("符号", dark: true, font: .systemFont(ofSize: 15)) { [weak self] in self?.showSymbols(true) }
-        spaceButton = makeKey("空格") { [weak self] in self?.tapSpace() }
-        let longPress = UILongPressGestureRecognizer(target: self, action: #selector(spaceLongPress(_:)))
-        longPress.minimumPressDuration = 0.35
-        spaceButton.addGestureRecognizer(longPress)
-        let globe = UIButton(type: .system)
-        globe.setImage(UIImage(systemName: "globe"), for: .normal)
-        globe.tintColor = .label
-        globe.backgroundColor = .systemGray3
-        globe.layer.cornerRadius = 6
-        globe.addTarget(self, action: #selector(handleInputModeList(from:with:)), for: .allTouchEvents)
-        globe.isHidden = !needsInputModeSwitchKey
-        let bottomMiddle = row([globe, symbolButton, spaceButton, zeroKey], equal: false)
-        for small in [globe, symbolButton!, zeroKey] {
-            let w = small.widthAnchor.constraint(equalTo: spaceButton.widthAnchor, multiplier: 0.4)
-            w.priority = .defaultHigh
-            w.isActive = true
-        }
-        zeroKey.isHidden = true
-        rows.append(bottomMiddle)
-        let middle = column(rows)
-
-        // Right: delete, clear, mic, return
-        let deleteKey = makeKey("⌫", dark: true) { [weak self] in self?.tapDelete() }
-        let clearKey = makeKey("重输", dark: true, font: .systemFont(ofSize: 15)) { [weak self] in self?.clearComposition() }
-        returnButton = makeKey("换行", dark: true, font: .systemFont(ofSize: 15)) { [weak self] in self?.tapReturn() }
-        let right = column([deleteKey, clearKey, returnButton])
-
-        let main = row([left, middle, right], equal: false)
-        left.widthAnchor.constraint(equalTo: middle.widthAnchor, multiplier: 0.2).isActive = true
-        right.widthAnchor.constraint(equalTo: middle.widthAnchor, multiplier: 0.22).isActive = true
-
-        for v in [statusLabel, pinyinScroll, candidateScroll, main] as [UIView] {
-            v.translatesAutoresizingMaskIntoConstraints = false
-            view.addSubview(v)
-        }
-        pinyinStack.translatesAutoresizingMaskIntoConstraints = false
-        candidateStack.translatesAutoresizingMaskIntoConstraints = false
-
-        NSLayoutConstraint.activate([
-            statusLabel.topAnchor.constraint(equalTo: view.topAnchor, constant: 4),
-            statusLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 10),
-            statusLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -10),
-            statusLabel.heightAnchor.constraint(equalToConstant: 22),
-
-            pinyinScroll.topAnchor.constraint(equalTo: view.topAnchor, constant: 4),
-            pinyinScroll.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 4),
-            pinyinScroll.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -4),
-            pinyinScroll.heightAnchor.constraint(equalToConstant: 22),
-            pinyinStack.topAnchor.constraint(equalTo: pinyinScroll.contentLayoutGuide.topAnchor),
-            pinyinStack.bottomAnchor.constraint(equalTo: pinyinScroll.contentLayoutGuide.bottomAnchor),
-            pinyinStack.leadingAnchor.constraint(equalTo: pinyinScroll.contentLayoutGuide.leadingAnchor),
-            pinyinStack.trailingAnchor.constraint(equalTo: pinyinScroll.contentLayoutGuide.trailingAnchor),
-            pinyinStack.heightAnchor.constraint(equalTo: pinyinScroll.frameLayoutGuide.heightAnchor),
-
-            candidateScroll.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 2),
-            candidateScroll.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 4),
-            candidateScroll.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -4),
-            candidateScroll.heightAnchor.constraint(equalToConstant: 40),
-            candidateStack.topAnchor.constraint(equalTo: candidateScroll.contentLayoutGuide.topAnchor),
-            candidateStack.bottomAnchor.constraint(equalTo: candidateScroll.contentLayoutGuide.bottomAnchor),
-            candidateStack.leadingAnchor.constraint(equalTo: candidateScroll.contentLayoutGuide.leadingAnchor),
-            candidateStack.trailingAnchor.constraint(equalTo: candidateScroll.contentLayoutGuide.trailingAnchor),
-            candidateStack.heightAnchor.constraint(equalTo: candidateScroll.frameLayoutGuide.heightAnchor),
-
-            main.topAnchor.constraint(equalTo: candidateScroll.bottomAnchor, constant: 4),
-            main.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 4),
-            main.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -4),
-
-            main.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -6),
-        ])
-        configureSymbolPanel(over: main)
-        updateKeyLabels()
+        reloadClipboardRows()
+        clipboardPanel.isHidden = false
+        keyArea.bringSubviewToFront(clipboardPanel)
     }
 
-    private func updateKeyLabels() {
-        for (i, b) in digitKeys.enumerated() {
-            if i < keyLetters.count {
-                let (d, letters) = keyLetters[i]
-                if mode == .number {
-                    b.setTitle(String(d), for: .normal)
-                    b.titleLabel?.font = .systemFont(ofSize: 22)
-                } else {
-                    b.setTitle(d == "1" ? "、" : letters, for: .normal)
-                    b.titleLabel?.font = .systemFont(ofSize: 17)
-                }
-            } else {
-                b.setTitle("0", for: .normal)
-            }
-        }
-        modeButton?.setTitle(mode == .number ? "拼音" : "123", for: .normal)
-        zeroButton?.isHidden = mode != .number
-    }
-
-    private func render() {
-        if capture.isCapturing {
-            spaceButton?.setTitle("🎤 松开结束", for: .normal)
-            spaceButton?.backgroundColor = .systemBlue
-            spaceButton?.setTitleColor(.white, for: .normal)
+    private func reloadClipboardRows() {
+        clipRows.forEach { $0.removeFromSuperview() }
+        let history = KeyboardSettings.clipboardHistory
+        if history.isEmpty {
+            let empty = UILabel()
+            empty.numberOfLines = 0
+            empty.textAlignment = .center
+            empty.font = .systemFont(ofSize: 14)
+            empty.textColor = .secondaryLabel
+            empty.text = hasFullAccess ? "暂无内容。复制文字后打开这里，点一下即可粘贴。" : "需在系统设置中为本键盘开启「允许完全访问」才能读取剪贴板。"
+            clipRows = [empty]
         } else {
-            spaceButton?.alpha = 1
-            spaceButton?.backgroundColor = .systemBackground
-            spaceButton?.setTitleColor(.label, for: .normal)
-            spaceButton?.setTitle(digits.isEmpty ? "空格" : "确定", for: .normal)
-        }
-    }
-
-    @objc private func spaceLongPress(_ g: UILongPressGestureRecognizer) {
-        switch g.state {
-        case .began:
-            if !digits.isEmpty {
-                if let first = candidates.first { commit(first) } else { clearComposition() }
-                digits = ""
-                refreshCandidates()
-            }
-            guard capture.isReady else { return setStatus("语音模块加载中，请稍后再试") }
-            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-            startDictation()
-        case .ended, .cancelled, .failed:
-            if capture.isCapturing { stopDictation() }
-        default:
-            break
-        }
-    }
-
-    // MARK: - Symbols page
-
-    private let symbolGroups: [(String, [String])] = [
-        ("中文", ["，", "。", "？", "！", "、", "：", "；", "“", "”", "‘", "’", "（", "）", "《", "》", "〈", "〉", "【", "】", "「", "」", "『", "』", "—", "……", "·", "～", "￥", "％", "＃", "＆", "＊", "＠", "→", "←", "↑", "↓", "√", "×", "÷", "℃", "°", "№", "§", "※", "○", "●", "△", "□", "☆", "★", "♀", "♂"]),
-        ("英文", [",", ".", "?", "!", ":", ";", "'", "\"", "(", ")", "[", "]", "{", "}", "<", ">", "-", "_", "+", "=", "/", "\\", "|", "~", "`", "@", "#", "$", "%", "^", "&", "*", "€", "£", "¥", "•"]),
-        ("表情", ["😀", "😂", "🤣", "😊", "😍", "😘", "😭", "😅", "🤔", "😎", "😡", "😱", "👍", "👏", "🙏", "💪", "❤️", "🎉", "🔥", "🌹", "😴", "🙄", "😉", "🤗", "😢", "👌", "✌️", "💯", "^_^", "(*^▽^*)", "o(╥﹏╥)o", "(￣▽￣)"]),
-    ]
-    private let symbolScroll = UIScrollView()
-    private let symbolGrid = UIStackView()
-    private var symbolTabButtons: [UIButton] = []
-
-    private func configureSymbolPanel(over main: UIView) {
-        symbolPanel.backgroundColor = UIColor.systemGray5
-        symbolPanel.isHidden = true
-        symbolPanel.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(symbolPanel)
-        NSLayoutConstraint.activate([
-            symbolPanel.topAnchor.constraint(equalTo: main.topAnchor),
-            symbolPanel.bottomAnchor.constraint(equalTo: main.bottomAnchor),
-            symbolPanel.leadingAnchor.constraint(equalTo: main.leadingAnchor),
-            symbolPanel.trailingAnchor.constraint(equalTo: main.trailingAnchor),
-        ])
-
-        symbolGrid.axis = .vertical
-        symbolGrid.spacing = 6
-        symbolGrid.translatesAutoresizingMaskIntoConstraints = false
-        symbolScroll.translatesAutoresizingMaskIntoConstraints = false
-        symbolScroll.addSubview(symbolGrid)
-
-        let backKey = makeKey("返回", dark: true, font: .systemFont(ofSize: 15)) { [weak self] in self?.showSymbols(false) }
-        symbolTabButtons = symbolGroups.enumerated().map { i, group in
-            makeKey(group.0, dark: true, font: .systemFont(ofSize: 15)) { [weak self] in self?.selectSymbolGroup(i) }
-        }
-        let del = makeKey("⌫", dark: true) { [weak self] in self?.textDocumentProxy.deleteBackward() }
-        let bar = row([backKey] + symbolTabButtons + [del])
-        bar.translatesAutoresizingMaskIntoConstraints = false
-
-        symbolPanel.addSubview(symbolScroll)
-        symbolPanel.addSubview(bar)
-        NSLayoutConstraint.activate([
-            symbolScroll.topAnchor.constraint(equalTo: symbolPanel.topAnchor),
-            symbolScroll.leadingAnchor.constraint(equalTo: symbolPanel.leadingAnchor),
-            symbolScroll.trailingAnchor.constraint(equalTo: symbolPanel.trailingAnchor),
-            symbolScroll.bottomAnchor.constraint(equalTo: bar.topAnchor, constant: -6),
-            symbolGrid.topAnchor.constraint(equalTo: symbolScroll.contentLayoutGuide.topAnchor),
-            symbolGrid.bottomAnchor.constraint(equalTo: symbolScroll.contentLayoutGuide.bottomAnchor),
-            symbolGrid.leadingAnchor.constraint(equalTo: symbolScroll.contentLayoutGuide.leadingAnchor),
-            symbolGrid.trailingAnchor.constraint(equalTo: symbolScroll.contentLayoutGuide.trailingAnchor),
-            symbolGrid.widthAnchor.constraint(equalTo: symbolScroll.frameLayoutGuide.widthAnchor),
-            bar.leadingAnchor.constraint(equalTo: symbolPanel.leadingAnchor),
-            bar.trailingAnchor.constraint(equalTo: symbolPanel.trailingAnchor),
-            bar.bottomAnchor.constraint(equalTo: symbolPanel.bottomAnchor),
-            bar.heightAnchor.constraint(equalToConstant: 40),
-        ])
-        selectSymbolGroup(0)
-    }
-
-    private func selectSymbolGroup(_ index: Int) {
-        for (i, b) in symbolTabButtons.enumerated() {
-            b.backgroundColor = i == index ? .systemBackground : .systemGray3
-        }
-        symbolGrid.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        let items = symbolGroups[index].1
-        let perRow = index == 2 ? 6 : 7
-        var i = 0
-        while i < items.count {
-            var keys: [UIView] = []
-            for j in 0..<perRow {
-                if i + j < items.count {
-                    let sym = items[i + j]
-                    keys.append(makeKey(sym, font: .systemFont(ofSize: sym.count > 3 ? 12 : 19)) { [weak self] in
-                        self?.textDocumentProxy.insertText(sym)
-                    })
-                } else {
-                    let spacer = UIView()
-                    keys.append(spacer)
+            clipRows = history.map { s in
+                let preview = s.replacingOccurrences(of: "\n", with: " ")
+                let b = makeKey(preview, size: 15) { [weak self] in
+                    self?.commitAll()
+                    self?.textDocumentProxy.insertText(s)
+                    self?.hidePanels()
                 }
+                b.titleLabel.textAlignment = .left
+                b.titleLabel.numberOfLines = 2
+                b.titleLabel.adjustsFontSizeToFitWidth = false
+                b.titleLabel.lineBreakMode = .byTruncatingTail
+                b.titleInset = 12
+                return b
             }
-            let r = row(keys)
-            r.heightAnchor.constraint(equalToConstant: 42).isActive = true
-            symbolGrid.addArrangedSubview(r)
-            i += perRow
         }
-        symbolScroll.setContentOffset(.zero, animated: false)
+        clipRows.forEach { clipScroll.addSubview($0) }
+        clipScroll.contentOffset = .zero
+        clipboardPanel.setNeedsLayout()
     }
 
-    private func showSymbols(_ show: Bool) {
-        if show, !digits.isEmpty, let first = candidates.first { commit(first) }
-        symbolPanel.isHidden = !show
-        if show { view.bringSubviewToFront(symbolPanel) }
+    private func toggleSettings() {
+        let wasHidden = settingsPanel.isHidden
+        hidePanels()
+        guard wasHidden else { return }
+        applySettings()
+        settingsPanel.isHidden = false
+        keyArea.bringSubviewToFront(settingsPanel)
     }
 
-    private func setStatus(_ text: String) {
-        statusLabel.text = text
+    // MARK: - Voice
+
+    private var holdHint: String { "松开 结束 · 上滑 取消" }
+
+    private func spaceDown() {
+        spaceHoldFired = false
+        cancelArmed = false
+        spaceTimer?.invalidate()
+        let timer = Timer(timeInterval: KeyboardSettings.holdDelay, target: self, selector: #selector(spaceHoldFire), userInfo: nil, repeats: false)
+        RunLoop.main.add(timer, forMode: .common)
+        spaceTimer = timer
+    }
+
+    @objc private func spaceHoldFire() {
+        spaceTimer = nil
+        guard voiceTrigger == .none else { return }
+        spaceHoldFired = true
+        commitAll()
+        startVoice(.spaceHold)
+    }
+
+    private func spaceUp(inside: Bool) {
+        if let timer = spaceTimer {
+            timer.invalidate()
+            spaceTimer = nil
+            if inside { tapSpace() }
+            return
+        }
+        guard spaceHoldFired else { return }
+        spaceHoldFired = false
+        if voiceTrigger == .spaceHold {
+            cancelArmed ? cancelVoice() : stopVoice()
+        }
+    }
+
+    private func spaceTracked(_ y: CGFloat) {
+        guard voiceTrigger == .spaceHold else { return }
+        let armed = y < -60
+        if armed != cancelArmed {
+            cancelArmed = armed
+            overlay.setCancelArmed(armed)
+            if armed { tick() }
+        }
+    }
+
+    private func micDown() {
+        if voiceTrigger == .micToggle {
+            ignoreMicUp = true
+            stopVoice()
+            return
+        }
+        guard voiceTrigger == .none else { return }
+        ignoreMicUp = false
+        micDownAt = Date()
+        cancelArmed = false
+        commitAll()
+        startVoice(.micHold)
+    }
+
+    private func micUp() {
+        if ignoreMicUp {
+            ignoreMicUp = false
+            return
+        }
+        guard voiceTrigger == .micHold else { return }
+        if Date().timeIntervalSince(micDownAt) < 0.35 {
+            // Quick tap: keep listening until 完成 / tap.
+            voiceTrigger = .micToggle
+            overlay.setButtons(true, hint: "说完后点「完成」")
+        } else {
+            stopVoice()
+        }
+    }
+
+    private func startVoice(_ trigger: VoiceTrigger) {
+        if let problem = dictation.permissionProblem(hasFullAccess: hasFullAccess) {
+            showStatus(problem, duration: 4)
+            return
+        }
+        guard dictation.capture.isReady else {
+            showStatus("语音模块加载中，请稍后再试")
+            return
+        }
+        hidePopup()
+        voiceTrigger = trigger
+        if hapticsOn {
+            startHaptic.impactOccurred()
+            startHaptic.prepare()
+        }
+        overlay.showListening(title: dictation.isMicWarm ? "正在聆听…" : "正在启动麦克风…",
+                              hint: trigger == .spaceHold ? holdHint : "松开 结束",
+                              buttons: false)
+        overlay.isHidden = false
+        view.bringSubviewToFront(overlay)
+        if !dictation.begin() {
+            voiceTrigger = .none
+            overlay.isHidden = true
+        }
+    }
+
+    private func stopVoice() {
+        guard voiceTrigger != .none, voiceTrigger != .finishing else { return }
+        voiceTrigger = .finishing
+        overlay.showRecognizing()
+        dictation.end()
+    }
+
+    private func cancelVoice() {
+        guard voiceTrigger != .none else { return }
+        voiceTrigger = .none
+        overlay.isHidden = true
+        dictation.cancel()
+    }
+
+    private func voiceFinished(_ text: String?) {
+        let wasActive = voiceTrigger != .none
+        voiceTrigger = .none
+        cancelArmed = false
+        overlay.isHidden = true
+        guard let text else { return }
+        if text.isEmpty {
+            if wasActive { showStatus("没有听清，请再说一次") }
+            return
+        }
+        textDocumentProxy.insertText(text)
     }
 }

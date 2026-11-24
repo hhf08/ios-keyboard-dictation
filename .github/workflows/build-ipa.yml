@@ -16,11 +16,20 @@ jobs:
         run: xcodegen generate
       - name: Build
         run: |
+          set -o pipefail
           xcodebuild -project KeyboardDictationDemo.xcodeproj \
             -scheme KeyboardDictationDemo -configuration Release \
             -sdk iphoneos -destination 'generic/platform=iOS' \
             -derivedDataPath build \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build 2>&1 | tee build.log | tail -5 \
+            || { echo "::group::compile errors"; grep -n -E "error:" build.log | head -100; echo "::endgroup::"; exit 1; }
+      - name: Embed entitlements (fakesign, optional)
+        continue-on-error: true
+        run: |
+          brew install ldid
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
+          ldid -SKeyboard.entitlements "$APP/PlugIns/KeyboardDictationDemoKeyboard.appex/KeyboardDictationDemoKeyboard"
+          ldid -SApp.entitlements "$APP/KeyboardDictationDemo"
       - name: Package IPA
         run: |
           APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
