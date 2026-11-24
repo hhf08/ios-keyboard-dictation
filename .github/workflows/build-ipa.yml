@@ -1,0 +1,39 @@
+name: Build unsigned IPA
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate project
+        run: xcodegen generate
+      - name: Build
+        run: |
+          xcodebuild -project KeyboardDictationDemo.xcodeproj \
+            -scheme KeyboardDictationDemo -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+      - name: Package IPA
+        run: |
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
+          ls -R "$APP" | head -50
+          mkdir -p Payload && cp -R "$APP" Payload/
+          zip -qry KeyboardDictationDemo-unsigned.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KeyboardDictationDemo-unsigned-ipa
+          path: KeyboardDictationDemo-unsigned.ipa
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Unsigned IPA build ${{ github.run_number }}
+          files: KeyboardDictationDemo-unsigned.ipa
