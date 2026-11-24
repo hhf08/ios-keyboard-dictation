@@ -42,10 +42,13 @@ final class T9Engine {
         let raw = table[digits]
         lock.unlock()
         guard let raw else { return [] }
-        return raw.split(separator: " ").compactMap { item in
-            guard let comma = item.lastIndex(of: ",") else { return nil }
-            return (String(item[..<comma]), String(item[item.index(after: comma)...]))
+        var out: [(String, String)] = []
+        for part in raw.components(separatedBy: " ") {
+            let pieces = part.components(separatedBy: ",")
+            guard pieces.count == 2 else { continue }
+            out.append((pieces[0], pieces[1]))
         }
+        return out
     }
 
     /// Candidates for the digit buffer: full matches first, then shorter prefixes.

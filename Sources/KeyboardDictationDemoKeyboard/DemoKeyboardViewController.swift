@@ -343,7 +343,7 @@ final class DemoKeyboardViewController: UIInputViewController {
         modeButton = makeKey("123", dark: true, font: .systemFont(ofSize: 15)) { [weak self] in self?.toggleMode() }
         let left = column(["，", "。", "？"].map { s in
             makeKey(s, dark: true) { [weak self] in self?.insertSymbol(s) }
-        } + [modeButton])
+        } + [modeButton!] as [UIView])
 
         // Middle: 3x3 + 0
         var rows: [UIView] = []
