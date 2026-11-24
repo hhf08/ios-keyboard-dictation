@@ -3,9 +3,9 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
-	<string>en</string>
+	<string>zh-Hans</string>
 	<key>CFBundleDisplayName</key>
-	<string>Dictation Demo</string>
+	<string>语音键盘</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -29,7 +29,7 @@
 			<key>PrefersRightToLeft</key>
 			<false/>
 			<key>PrimaryLanguage</key>
-			<string>en-US</string>
+			<string>zh-Hans</string>
 			<key>RequestsOpenAccess</key>
 			<true/>
 		</dict>
@@ -39,8 +39,8 @@
 		<string>DemoKeyboardViewController</string>
 	</dict>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>The demo keyboard records your voice to dictate text.</string>
+	<string>键盘需要使用麦克风录制你的语音来输入文字。</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>The demo keyboard transcribes your voice into text.</string>
+	<string>键盘需要语音识别把你的语音转成文字。</string>
 </dict>
 </plist>

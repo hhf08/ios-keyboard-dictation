@@ -13,16 +13,16 @@ struct ContentView: View {
         NavigationStack {
             Form {
                 Section("1. Permissions") {
-                    LabeledContent("Microphone", value: microphoneLabel)
-                    LabeledContent("Speech recognition", value: speechLabel)
-                    Button("Grant permissions", action: requestPermissions)
-                    Button("Check Apple Speech in this app", action: checkSpeech)
+                    LabeledContent("麦克风", value: microphoneLabel)
+                    LabeledContent("语音识别", value: speechLabel)
+                    Button("授予权限", action: requestPermissions)
+                    Button("在本 App 中测试语音识别", action: checkSpeech)
                     if !speechCheck.isEmpty { Text(speechCheck).font(.footnote) }
                 }
 
                 Section("2. Enable the keyboard") {
-                    Text("Settings → General → Keyboard → Keyboards → Add New Keyboard → Dictation Demo, then turn on Allow Full Access.")
-                    Button("Open Settings") {
+                    Text("设置 → 通用 → 键盘 → 键盘 → 添加新键盘 → 语音键盘，然后打开「允许完全访问」。")
+                    Button("打开设置") {
                         if let url = URL(string: UIApplication.openSettingsURLString) {
                             UIApplication.shared.open(url)
                         }
@@ -30,40 +30,40 @@ struct ContentView: View {
                 }
 
                 Section("3. Try it") {
-                    TextField("Switch to the Dictation Demo keyboard here", text: $text, axis: .vertical)
+                    TextField("在这里切换到语音键盘试试", text: $text, axis: .vertical)
                         .lineLimit(3...8)
-                    Text("Tap Dictate on the keyboard, speak, then tap Stop. Audio is captured by a hidden WKWebView inside the keyboard, so you never leave this app.")
+                    Text("点键盘上的「语音输入」开始说话，说完点「停止」，文字会自动输入，无需离开当前 App。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
             }
-            .navigationTitle("Keyboard Dictation")
+            .navigationTitle("语音键盘")
         }
     }
 
     private var microphoneLabel: String {
         switch microphone {
-        case .granted: "Granted"
-        case .denied: "Denied"
-        default: "Not requested"
+        case .granted: "已授权"
+        case .denied: "已拒绝"
+        default: "未请求"
         }
     }
 
     private var speechLabel: String {
         switch speech {
-        case .authorized: "Granted"
-        case .denied: "Denied"
-        case .restricted: "Restricted"
-        default: "Not requested"
+        case .authorized: "已授权"
+        case .denied: "已拒绝"
+        case .restricted: "受限制"
+        default: "未请求"
         }
     }
 
     /// Feeds a second of silence to the recognizer to tell a simulator-wide Speech failure
     /// apart from one specific to the keyboard extension sandbox.
     private func checkSpeech() {
-        speechCheck = "Checking…"
-        guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US")) else {
-            speechCheck = "No recognizer for en-US"
+        speechCheck = "检测中…"
+        guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN")) else {
+            speechCheck = "不支持中文识别"
             return
         }
         let request = SFSpeechAudioBufferRecognitionRequest()
@@ -74,9 +74,9 @@ struct ContentView: View {
         speechTask = recognizer.recognitionTask(with: request) { result, error in
             DispatchQueue.main.async {
                 if let error {
-                    speechCheck = "Speech error: \(error.localizedDescription)"
+                    speechCheck = "语音识别出错：\(error.localizedDescription)"
                 } else if result?.isFinal == true {
-                    speechCheck = "Speech works in the app."
+                    speechCheck = "语音识别正常。"
                 }
             }
         }

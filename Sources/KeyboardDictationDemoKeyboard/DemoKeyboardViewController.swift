@@ -12,7 +12,7 @@ final class DemoKeyboardViewController: UIInputViewController {
     private let nextKeyboardButton = UIButton(type: .system)
     private let statusLabel = UILabel()
 
-    private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+    private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN"))
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
     private let audioFormat = AVAudioFormat(
@@ -27,7 +27,7 @@ final class DemoKeyboardViewController: UIInputViewController {
         super.viewDidLoad()
         configureView()
         capture.onReady = { [weak self] in self?.render() }
-        capture.onStarted = { [weak self] in self?.setStatus("Listening…") }
+        capture.onStarted = { [weak self] in self?.setStatus("正在聆听…") }
         capture.onAudio = { [weak self] data, rms in self?.append(data, rms: rms) }
         capture.onEnded = { [weak self] reason in self?.captureEnded(reason) }
         capture.attach(to: view)
@@ -51,16 +51,16 @@ final class DemoKeyboardViewController: UIInputViewController {
 
     private func startDictation() {
         guard hasFullAccess else {
-            return setStatus("Turn on Allow Full Access for this keyboard in Settings.")
+            return setStatus("请在设置中为此键盘打开「允许完全访问」。")
         }
         guard AVAudioSession.sharedInstance().recordPermission == .granted else {
-            return setStatus("Open the Dictation Demo app and grant microphone access.")
+            return setStatus("请打开「语音键盘」App 授予麦克风权限。")
         }
         guard SFSpeechRecognizer.authorizationStatus() == .authorized else {
-            return setStatus("Open the Dictation Demo app and grant speech recognition.")
+            return setStatus("请打开「语音键盘」App 授予语音识别权限。")
         }
         guard let recognizer, recognizer.isAvailable else {
-            return setStatus("Speech recognition is unavailable right now.")
+            return setStatus("语音识别暂时不可用。")
         }
 
         let request = SFSpeechAudioBufferRecognitionRequest()
@@ -74,7 +74,7 @@ final class DemoKeyboardViewController: UIInputViewController {
             DispatchQueue.main.async { self?.handle(result: result, error: error) }
         }
         capture.start()
-        setStatus("Starting microphone…")
+        setStatus("正在启动麦克风…")
         render()
     }
 
@@ -87,7 +87,7 @@ final class DemoKeyboardViewController: UIInputViewController {
         log.info("captured \(self.capturedSamples) samples")
         request?.endAudio()
         if request == nil {
-            finishRecognition(status: speechError.map { String(format: "Mic captured %.1fs. Speech: %@", Double(capturedSamples) / WebAudioCapture.sampleRate, $0) } ?? "Done.")
+            finishRecognition(status: speechError.map { String(format: "已录音 %.1f 秒。识别：%@", Double(capturedSamples) / WebAudioCapture.sampleRate, $0) } ?? "完成。")
         }
         if reason != "stopped" { setStatus(reason) }
         render()
@@ -99,7 +99,7 @@ final class DemoKeyboardViewController: UIInputViewController {
         capturedSamples += Int(frames)
         let seconds = Double(capturedSamples) / WebAudioCapture.sampleRate
         let level = String(repeating: "▮", count: min(Int(rms * 60), 10))
-        setStatus(String(format: "Mic %.1fs %@", seconds, level) + (speechError.map { " · Speech: \($0)" } ?? ""))
+        setStatus(String(format: "录音 %.1f 秒 %@", seconds, level) + (speechError.map { " · 识别：\($0)" } ?? ""))
         dictateButton.alpha = 0.6 + CGFloat(min(rms * 8, 0.4))
 
         guard let request, let buffer = AVAudioPCMBuffer(pcmFormat: audioFormat, frameCapacity: frames) else { return }
@@ -115,7 +115,7 @@ final class DemoKeyboardViewController: UIInputViewController {
             replacePartial(with: result.bestTranscription.formattedString)
             if result.isFinal {
                 if !insertedPartial.isEmpty { textDocumentProxy.insertText(" ") }
-                finishRecognition(status: "Inserted.")
+                finishRecognition(status: "已输入。")
             }
         } else if let error {
             log.error("recognition error: \(error.localizedDescription, privacy: .public)")
@@ -125,7 +125,7 @@ final class DemoKeyboardViewController: UIInputViewController {
                 task = nil
                 request = nil
             } else {
-                finishRecognition(status: speechError.map { "Speech: \($0)" } ?? "Done.")
+                finishRecognition(status: speechError.map { "识别：\($0)" } ?? "完成。")
             }
         }
     }
@@ -192,14 +192,14 @@ final class DemoKeyboardViewController: UIInputViewController {
     private func render() {
         nextKeyboardButton.isHidden = !needsInputModeSwitchKey
         if capture.isCapturing {
-            dictateButton.setTitle("Stop", for: .normal)
+            dictateButton.setTitle("停止", for: .normal)
             dictateButton.backgroundColor = .systemRed
         } else {
             dictateButton.alpha = 1
-            dictateButton.setTitle(capture.isReady ? "Dictate" : "Loading…", for: .normal)
+            dictateButton.setTitle(capture.isReady ? "语音输入" : "加载中…", for: .normal)
             dictateButton.backgroundColor = capture.isReady ? .systemBlue : .systemGray
             dictateButton.isEnabled = capture.isReady
-            if statusLabel.text == nil { setStatus("Tap Dictate and speak. You stay in this app.") }
+            if statusLabel.text == nil { setStatus("点「语音输入」开始说话。") }
         }
     }
 
