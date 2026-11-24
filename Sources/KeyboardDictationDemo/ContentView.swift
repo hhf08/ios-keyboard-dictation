@@ -12,7 +12,7 @@ struct ContentView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("1. Permissions") {
+                Section("第一步：授予权限") {
                     LabeledContent("麦克风", value: microphoneLabel)
                     LabeledContent("语音识别", value: speechLabel)
                     Button("授予权限", action: requestPermissions)
@@ -20,7 +20,7 @@ struct ContentView: View {
                     if !speechCheck.isEmpty { Text(speechCheck).font(.footnote) }
                 }
 
-                Section("2. Enable the keyboard") {
+                Section("第二步：启用键盘") {
                     Text("设置 → 通用 → 键盘 → 键盘 → 添加新键盘 → 语音键盘，然后打开「允许完全访问」。")
                     Button("打开设置") {
                         if let url = URL(string: UIApplication.openSettingsURLString) {
@@ -29,10 +29,10 @@ struct ContentView: View {
                     }
                 }
 
-                Section("3. Try it") {
+                Section("第三步：试一试") {
                     TextField("在这里切换到语音键盘试试", text: $text, axis: .vertical)
                         .lineLimit(3...8)
-                    Text("点键盘上的「语音输入」开始说话，说完点「停止」，文字会自动输入，无需离开当前 App。")
+                    Text("九宫格拼音：按字母键打拼音，点上方候选词上屏，空格选第一个候选，上方一排可选具体拼音。「123」切换数字。点「🎤 语音」说普通话，说完点「停止」，文字自动输入。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
