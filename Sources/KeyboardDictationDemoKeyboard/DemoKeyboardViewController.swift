@@ -53,7 +53,7 @@ final class DemoKeyboardViewController: UIInputViewController {
         guard hasFullAccess else {
             return setStatus("Turn on Allow Full Access for this keyboard in Settings.")
         }
-        guard AVAudioApplication.shared.recordPermission == .granted else {
+        guard AVAudioSession.sharedInstance().recordPermission == .granted else {
             return setStatus("Open the Dictation Demo app and grant microphone access.")
         }
         guard SFSpeechRecognizer.authorizationStatus() == .authorized else {

@@ -3,7 +3,7 @@ import Speech
 import SwiftUI
 
 struct ContentView: View {
-    @State private var microphone = AVAudioApplication.shared.recordPermission
+    @State private var microphone = AVAudioSession.sharedInstance().recordPermission
     @State private var speech = SFSpeechRecognizer.authorizationStatus()
     @State private var text = ""
     @State private var speechCheck = ""
@@ -85,10 +85,10 @@ struct ContentView: View {
     }
 
     private func requestPermissions() {
-        AVAudioApplication.requestRecordPermission { _ in
+        AVAudioSession.sharedInstance().requestRecordPermission { _ in
             SFSpeechRecognizer.requestAuthorization { _ in
                 DispatchQueue.main.async {
-                    microphone = AVAudioApplication.shared.recordPermission
+                    microphone = AVAudioSession.sharedInstance().recordPermission
                     speech = SFSpeechRecognizer.authorizationStatus()
                 }
             }
