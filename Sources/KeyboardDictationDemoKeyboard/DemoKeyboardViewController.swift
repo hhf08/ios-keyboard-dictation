@@ -644,8 +644,8 @@ final class DemoKeyboardViewController: UIInputViewController {
         }
         let layoutLabel = label("中文键盘布局")
         let hapticLabel = label("按键震动")
-        let prewarmLabel = label("麦克风预热（按下即录，状态栏会显示麦克风）")
-        let onDeviceLabel = label("离线识别优先（更快，准确率略低）")
+        let prewarmLabel = label("麦克风预热（会一直占用麦克风）")
+        let onDeviceLabel = label("离线识别优先（更快，不可用时自动联网）")
         let inlineLabel = label("语音上屏兼容模式（逐段替换）")
         inlineCompatSwitch.addAction(UIAction { [weak self] _ in
             guard let self else { return }

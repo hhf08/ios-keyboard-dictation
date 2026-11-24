@@ -15,8 +15,8 @@ enum KeyboardSettings {
     enum Key {
         static let layout = "layout"
         static let haptics = "haptics"
-        static let micPrewarm = "micPrewarm"
-        static let onDevice = "onDeviceRecognition"
+        static let micPrewarm = "micPrewarmV2"
+        static let onDevice = "onDeviceRecognitionV2"
         static let holdDelay = "holdDelay"
         static let clipboard = "clipboardHistory"
         static let inlineCompat = "inlineCompat"
@@ -36,14 +36,16 @@ enum KeyboardSettings {
         set { defaults.set(newValue, forKey: Key.haptics) }
     }
 
-    /// Keep the microphone stream open while the keyboard is visible so dictation starts instantly.
+    /// Opens the microphone when the keyboard appears (keeps it occupied while visible). Off by default;
+    /// the microphone is released after every dictation even when this is on.
     static var micPrewarm: Bool {
-        get { defaults.object(forKey: Key.micPrewarm) as? Bool ?? true }
+        get { defaults.object(forKey: Key.micPrewarm) as? Bool ?? false }
         set { defaults.set(newValue, forKey: Key.micPrewarm) }
     }
 
+    /// Prefer on-device recognition when the system supports it (faster); falls back to the server.
     static var onDeviceRecognition: Bool {
-        get { defaults.object(forKey: Key.onDevice) as? Bool ?? false }
+        get { defaults.object(forKey: Key.onDevice) as? Bool ?? true }
         set { defaults.set(newValue, forKey: Key.onDevice) }
     }
 

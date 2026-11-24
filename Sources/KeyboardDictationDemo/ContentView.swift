@@ -11,8 +11,8 @@ struct ContentView: View {
 
     @AppStorage(KeyboardSettings.Key.layout, store: KeyboardSettings.defaults) private var layout = ChineseLayout.t9.rawValue
     @AppStorage(KeyboardSettings.Key.haptics, store: KeyboardSettings.defaults) private var haptics = true
-    @AppStorage(KeyboardSettings.Key.micPrewarm, store: KeyboardSettings.defaults) private var micPrewarm = true
-    @AppStorage(KeyboardSettings.Key.onDevice, store: KeyboardSettings.defaults) private var onDevice = false
+    @AppStorage(KeyboardSettings.Key.micPrewarm, store: KeyboardSettings.defaults) private var micPrewarm = false
+    @AppStorage(KeyboardSettings.Key.onDevice, store: KeyboardSettings.defaults) private var onDevice = true
     @AppStorage(KeyboardSettings.Key.inlineCompat, store: KeyboardSettings.defaults) private var inlineCompat = false
     @AppStorage(KeyboardSettings.Key.holdDelay, store: KeyboardSettings.defaults) private var holdDelay = 0.2
 
@@ -47,8 +47,8 @@ struct ContentView: View {
                     }
                     .pickerStyle(.segmented)
                     Toggle("按键震动", isOn: $haptics)
-                    Toggle("麦克风预热（按下即录）", isOn: $micPrewarm)
-                    Toggle("离线识别优先", isOn: $onDevice)
+                    Toggle("麦克风预热（会一直占用麦克风）", isOn: $micPrewarm)
+                    Toggle("离线识别优先（更快）", isOn: $onDevice)
                     Toggle("语音上屏兼容模式（逐段替换）", isOn: $inlineCompat)
                     Picker("长按空格开始说话", selection: $holdDelay) {
                         Text("0.15 秒").tag(0.15)
@@ -59,7 +59,7 @@ struct ContentView: View {
                 } header: {
                     Text("键盘设置")
                 } footer: {
-                    Text("麦克风预热：键盘弹出时提前打开麦克风，按下即开始录音、不丢第一个字，状态栏会显示麦克风指示；关闭后更省电，但开始说话前会有短暂启动。离线识别更快但准确率略低，需系统已下载中文离线模型。若这里的设置在键盘中没有生效，可点键盘工具栏上的 ⚙︎ 直接修改。")
+                    Text("麦克风预热（默认关闭）：开启后键盘弹出时就打开麦克风，键盘显示期间会一直占用麦克风、状态栏显示麦克风指示；每次说完松手后麦克风都会立即释放。关闭时只在按住说话期间使用麦克风，松手即释放。离线识别更快，需系统已下载中文离线模型，不可用时自动改用联网识别。若这里的设置在键盘中没有生效，可点键盘工具栏上的 ⚙︎ 直接修改。")
                 }
 
                 Section("语音输入指南") {

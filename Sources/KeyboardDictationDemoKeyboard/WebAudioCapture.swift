@@ -6,9 +6,9 @@ import WebKit
 /// the keyboard-process audio restrictions that break `AVAudioEngine` / `AudioQueue`, so the
 /// user never has to jump to another app (免跳转).
 ///
-/// For instant start the stream can be pre-warmed (`warm()`): the microphone stays open while
-/// the keyboard is visible, the last ~300 ms are kept in a ring buffer, and `start()` only flips
-/// a flag and flushes that pre-roll — so the first syllable is never lost.
+/// Optional pre-warm (`warm()`, off by default): the microphone opens when the keyboard appears and
+/// the last ~300 ms are kept in a ring buffer. Even when warm, the microphone is released completely
+/// as soon as a dictation ends (`stop()`), so nothing keeps the mic indicator on while idle.
 ///
 /// Emits 16 kHz mono Int16 PCM chunks through `onAudio`.
 @MainActor
@@ -19,6 +19,8 @@ final class WebAudioCapture: NSObject {
     var onStarted: (() -> Void)?
     var onAudio: ((Data, Float) -> Void)?
     var onEnded: ((String) -> Void)?
+    /// Called once WebKit has fully released the microphone after `stop()` / `cool()`.
+    var onReleased: (() -> Void)?
 
     private(set) var isReady = false
     private(set) var isCapturing = false
@@ -26,6 +28,8 @@ final class WebAudioCapture: NSObject {
     private var wantsWarm = false
     private let webView: WKWebView
     private var heartbeat: Timer?
+    /// Bumped on every start so a late release never kills a newer capture.
+    private var generation = 0
 
     override init() {
         let configuration = WKWebViewConfiguration()
@@ -62,12 +66,41 @@ final class WebAudioCapture: NSObject {
         webView.evaluateJavaScript("warmCapture(); 0", completionHandler: nil)
     }
 
-    /// Releases a pre-warmed microphone.
+    /// Releases the microphone completely (pre-warmed or capturing).
     func cool() {
         wantsWarm = false
         isWarm = false
-        if isReady { webView.evaluateJavaScript("coolCapture(); 0", completionHandler: nil) }
+        if isCapturing {
+            stop()
+            return
+        }
         updateHeartbeat()
+        releaseMicrophone(js: "coolCapture(); 0")
+    }
+
+    /// Stops every track in the page, then tells WebKit to end microphone capture so the
+    /// status-bar indicator goes off at once.
+    private func releaseMicrophone(js: String) {
+        let gen = generation
+        guard isReady else {
+            onReleased?()
+            return
+        }
+        webView.evaluateJavaScript(js) { [weak self] _, _ in
+            DispatchQueue.main.async {
+                guard let self, gen == self.generation, !self.isCapturing, !self.wantsWarm else { return }
+                if #available(iOS 15.0, *) {
+                    self.webView.setMicrophoneCaptureState(.none) { [weak self] in
+                        DispatchQueue.main.async {
+                            guard let self, gen == self.generation, !self.isCapturing else { return }
+                            self.onReleased?()
+                        }
+                    }
+                } else {
+                    self.onReleased?()
+                }
+            }
+        }
     }
 
     @discardableResult
@@ -75,6 +108,7 @@ final class WebAudioCapture: NSObject {
         guard isReady else { return false }
         guard !isCapturing else { return true }
         isCapturing = true
+        generation += 1
         updateHeartbeat()
         webView.evaluateJavaScript("startCapture(); 0") { [weak self] _, error in
             if let error {
@@ -85,10 +119,14 @@ final class WebAudioCapture: NSObject {
         return true
     }
 
+    /// Stops capture and releases the microphone immediately — also when pre-warm is on; the
+    /// stream is only re-warmed the next time the keyboard appears.
     func stop() {
         guard isCapturing else { return }
-        webView.evaluateJavaScript("stopCapture(); 0", completionHandler: nil)
+        wantsWarm = false
+        isWarm = false
         finish(reason: "stopped")
+        releaseMicrophone(js: "stopCapture(); 0")
     }
 
     func tearDown() {
@@ -143,7 +181,9 @@ final class WebAudioCapture: NSObject {
             onAudio?(data, (message["rms"] as? NSNumber)?.floatValue ?? 0)
         case "interrupted", "failed":
             isWarm = false
+            wantsWarm = false
             finish(reason: "\(type): \(message["reason"] as? String ?? "unknown")")
+            releaseMicrophone(js: "0")
         default:
             break
         }
@@ -202,7 +242,7 @@ final class WebAudioCapture: NSObject {
           l.context = context;
           await context.resume();
           if (live !== l) return;
-          const processor = context.createScriptProcessor(1024, 1, 1);
+          const processor = context.createScriptProcessor(512, 1, 1);
           const sink = context.createGain();
           sink.gain.value = 0;
           processor.connect(sink);
@@ -250,7 +290,7 @@ final class WebAudioCapture: NSObject {
       try { await acquire(); if (live) post({ type: 'warm' }); }
       catch (error) { warm = false; post({ type: 'warmFailed', reason: error.name + ': ' + error.message }); }
     };
-    window.coolCapture = () => { warm = false; if (!forwarding) release(); };
+    window.coolCapture = () => { warm = false; forwarding = false; release(); };
     window.startCapture = async () => {
       forwarding = true;
       try {
@@ -266,7 +306,8 @@ final class WebAudioCapture: NSObject {
         post({ type: 'failed', reason: error.name + ': ' + error.message });
       }
     };
-    window.stopCapture = () => { forwarding = false; ring = []; ringSamples = 0; if (!warm) release(); };
+    // Release always: the microphone must never stay open after a dictation ends.
+    window.stopCapture = () => { forwarding = false; warm = false; release(); };
     post({ type: 'ready' });
     </script></body></html>
     """
