@@ -1119,8 +1119,6 @@ final class DemoKeyboardViewController: UIInputViewController {
 
     // MARK: - Voice
 
-    private var holdHint: String { "松开 结束 · 上滑 取消" }
-
     private func spaceDown() {
         spaceHoldFired = false
         cancelArmed = false
@@ -1225,12 +1223,10 @@ final class DemoKeyboardViewController: UIInputViewController {
 
     private func stopVoice() {
         guard voiceTrigger != .none, voiceTrigger != .finishing else { return }
+        // Stop at once: commits the current inline partial and restores the bar (no 识别中 wait).
         voiceTrigger = .finishing
-        // Listening is over: the wave settles while the final result arrives.
-        waveBar.setQuiet()
-        waveBar.setArmed(false)
-        waveBar.doneButton.isHidden = true
         dictation.end()
+        if voiceTrigger != .none { voiceFinished(inlineText) }
     }
 
     private func cancelVoice() {

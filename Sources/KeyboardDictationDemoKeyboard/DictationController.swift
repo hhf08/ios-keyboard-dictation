@@ -36,7 +36,6 @@ final class DictationController: NSObject {
     private var nextID = 0
     private var spare: Session?
     private var active: Session?
-    private var finishTimer: Timer?
     private var onDevice = false
     private var visible = false
 
@@ -128,39 +127,26 @@ final class DictationController: NSObject {
         return true
     }
 
-    /// Stops listening; the final text arrives through `onFinish`.
+    /// Stops listening immediately: audio and recognition stop now and the last partial is
+    /// delivered through `onFinish` synchronously. Late recognizer results are ignored.
     func end() {
         guard let session = active else {
             onFinish?("")
             return
         }
-        guard !session.ended else { return }
         session.ended = true
-        capture.stop()
-        session.request.endAudio()
-        scheduleFinishTimeout()
+        finalize(session)
     }
 
     func cancel() {
         guard let session = active else { return }
         active = nil
-        finishTimer?.invalidate()
-        finishTimer = nil
-        session.task?.cancel()
+        session.ended = true
         if capture.isCapturing { capture.stop() }
+        session.request.endAudio()
+        session.task?.cancel()
         onFinish?(nil)
         refillSpare()
-    }
-
-    private func scheduleFinishTimeout() {
-        finishTimer?.invalidate()
-        let timer = Timer(timeInterval: 2.5, target: self, selector: #selector(finishTimedOut), userInfo: nil, repeats: false)
-        RunLoop.main.add(timer, forMode: .common)
-        finishTimer = timer
-    }
-
-    @objc private func finishTimedOut() {
-        if let session = active { finalize(session) }
     }
 
     private func refillSpare() {
@@ -171,10 +157,11 @@ final class DictationController: NSObject {
 
     private func finalize(_ session: Session) {
         guard active === session else { return }
+        // Detach first so any result that arrives afterwards is dropped by `handle`.
         active = nil
-        finishTimer?.invalidate()
-        finishTimer = nil
+        session.ended = true
         if capture.isCapturing { capture.stop() }
+        session.request.endAudio()
         if !session.isFinal { session.task?.cancel() }
         onFinish?(session.text)
         refillSpare()
@@ -207,10 +194,9 @@ final class DictationController: NSObject {
     private func captureEnded(_ reason: String) {
         log.info("capture ended: \(reason, privacy: .public)")
         guard reason != "stopped", let session = active, !session.ended else { return }
-        session.ended = true
-        session.request.endAudio()
-        scheduleFinishTimeout()
-        if session.text.isEmpty {
+        let hadText = !session.text.isEmpty
+        finalize(session)
+        if !hadText {
             onFailure?(reason.contains("NotAllowed") ? "无法使用麦克风：请确认已开启完全访问并授予麦克风权限" : "麦克风已中断（\(reason)）")
         }
     }
