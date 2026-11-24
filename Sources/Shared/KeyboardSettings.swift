@@ -20,6 +20,7 @@ enum KeyboardSettings {
         static let holdDelay = "holdDelay"
         static let clipboard = "clipboardHistory"
         static let inlineCompat = "inlineCompat"
+        static let heightScale = "keyboardHeightScale"
     }
 
     static var defaults: UserDefaults {
@@ -63,6 +64,27 @@ enum KeyboardSettings {
     static var inlineCompat: Bool {
         get { defaults.object(forKey: Key.inlineCompat) as? Bool ?? false }
         set { defaults.set(newValue, forKey: Key.inlineCompat) }
+    }
+
+    /// Keyboard height as a fraction of the default (0.8 – 1.3). Scales the key area of every page.
+    static let heightScaleRange: ClosedRange<Double> = 0.8...1.3
+    static var heightScale: Double {
+        get {
+            let v = defaults.double(forKey: Key.heightScale)
+            return v > 0 ? min(max(v, heightScaleRange.lowerBound), heightScaleRange.upperBound) : 1.0
+        }
+        set { defaults.set(min(max(newValue, heightScaleRange.lowerBound), heightScaleRange.upperBound), forKey: Key.heightScale) }
+    }
+
+    /// Default heights (points) of the whole keyboard and of its fixed top bar.
+    static let defaultPortraitHeight: Double = 266
+    static let defaultLandscapeHeight: Double = 206
+    static let topBarHeight: Double = 48
+
+    /// Total keyboard height for a scale: the top bar stays fixed, the key rows scale.
+    static func keyboardHeight(landscape: Bool, scale: Double) -> Double {
+        let base = landscape ? defaultLandscapeHeight : defaultPortraitHeight
+        return (topBarHeight + (base - topBarHeight) * scale).rounded()
     }
 
     static var clipboardHistory: [String] {

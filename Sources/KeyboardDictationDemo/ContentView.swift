@@ -15,6 +15,7 @@ struct ContentView: View {
     @AppStorage(KeyboardSettings.Key.onDevice, store: KeyboardSettings.defaults) private var onDevice = true
     @AppStorage(KeyboardSettings.Key.inlineCompat, store: KeyboardSettings.defaults) private var inlineCompat = false
     @AppStorage(KeyboardSettings.Key.holdDelay, store: KeyboardSettings.defaults) private var holdDelay = 0.2
+    @AppStorage(KeyboardSettings.Key.heightScale, store: KeyboardSettings.defaults) private var heightScale = 1.0
 
     var body: some View {
         NavigationStack {
@@ -62,15 +63,49 @@ struct ContentView: View {
                     Text("麦克风预热（默认关闭）：开启后键盘弹出时就打开麦克风，键盘显示期间会一直占用麦克风、状态栏显示麦克风指示；每次说完松手后麦克风都会立即释放。关闭时只在按住说话期间使用麦克风，松手即释放。离线识别更快，需系统已下载中文离线模型，不可用时自动改用联网识别。若这里的设置在键盘中没有生效，可点键盘工具栏上的 ⚙︎ 直接修改。")
                 }
 
+                Section {
+                    HStack {
+                        Text("键盘高度")
+                        Spacer()
+                        Text(heightScaleLabel)
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                        Button("默认") { heightScale = 1.0 }
+                            .buttonStyle(.bordered)
+                            .disabled(abs(heightScale - 1.0) < 0.001)
+                    }
+                    Slider(value: $heightScale, in: KeyboardSettings.heightScaleRange, step: 0.05) {
+                        Text("键盘高度")
+                    } minimumValueLabel: {
+                        Text("矮").font(.caption)
+                    } maximumValueLabel: {
+                        Text("高").font(.caption)
+                    }
+                    HStack(alignment: .bottom, spacing: 12) {
+                        RoundedRectangle(cornerRadius: 6)
+                            .fill(Color.secondary.opacity(0.25))
+                            .overlay(Text("预览").font(.caption).foregroundStyle(.secondary))
+                            .frame(width: 70, height: CGFloat(KeyboardSettings.keyboardHeight(landscape: false, scale: heightScale)) / 3)
+                        Text("竖屏约 \(Int(KeyboardSettings.keyboardHeight(landscape: false, scale: heightScale))) pt，横屏约 \(Int(KeyboardSettings.keyboardHeight(landscape: true, scale: heightScale))) pt。九键、全键盘、英文、123、符号各页的按键行一起缩放。")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                    .animation(.easeOut(duration: 0.15), value: heightScale)
+                } header: {
+                    Text("键盘高度")
+                } footer: {
+                    Text("范围 80%–130%。修改后重新弹出键盘即生效；也可在键盘工具栏 ⚙︎ 中拖动滑块实时调整。")
+                }
+
                 Section("语音输入指南") {
-                    Label("长按空格键说话，松开结束，文字自动上屏", systemImage: "space")
+                    Label("按住空格即开始收音，按住超过设定时长进入说话模式，松开立即结束并上屏；轻点空格仍是输入空格", systemImage: "space")
                     Label("说话时手指上滑可取消本次输入", systemImage: "arrow.up")
                     Label("点工具栏的麦克风开始说话，再点「完成」结束；按住麦克风则松开结束", systemImage: "mic")
                     Label("说话时上方浮窗实时显示识别结果，全程不用跳转到其他 App", systemImage: "text.bubble")
                 }
 
                 Section("百度风格键盘说明") {
-                    Text("九键：左侧是常用标点，输入时变为拼音选择；「分词」键插入分隔符；⌫ 长按连续删除；「重输」清空拼音；上方候选栏点 ⌄ 展开全部候选。全键盘：字母直接拼音，「分词」键插入 '。英文：⇧ 单击大写一次、双击锁定大写。「123」数字键盘，「符号」中文/英文/表情符号页，「中/英」切换语言。工具栏：语音、剪贴板、九键/全键盘切换、设置、收起键盘。")
+                    Text("九键：左侧是常用标点，输入时变为拼音选择；「分词」键插入分隔符；⌫ 长按连续删除；「重输」清空拼音；上方候选栏点 ⌄ 展开全部候选。全键盘：字母直接拼音，「分词」键插入 '。英文：⇧ 单击大写一次、双击锁定大写。「123」数字键盘，「符号」中文/英文/表情符号页，「中/英」切换语言。工具栏：语音、九键/全键盘切换、剪贴板、设置、收起键盘。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -82,6 +117,11 @@ struct ContentView: View {
             }
             .navigationTitle("语音键盘")
         }
+    }
+
+    private var heightScaleLabel: String {
+        let pct = Int((heightScale * 100).rounded())
+        return pct == 100 ? "默认 100%" : "\(pct)%"
     }
 
     private var microphoneLabel: String {

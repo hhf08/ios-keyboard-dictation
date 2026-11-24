@@ -14,9 +14,11 @@ final class DemoKeyboardViewController: UIInputViewController {
     private enum Lang { case chinese, english }
     private enum Page { case main, number, symbols }
     private enum Shift { case off, once, locked }
-    private enum VoiceTrigger { case none, spaceHold, micHold, micToggle, finishing }
+    /// `spaceSpeculative`: space is down, the microphone and recognizer are already running but the
+    /// hold threshold has not passed yet (no UI, no text). Becomes `spaceHold` or is cancelled.
+    private enum VoiceTrigger { case none, spaceSpeculative, spaceHold, micHold, micToggle, finishing }
 
-    private static let topBarHeight: CGFloat = 48
+    private static let topBarHeight = CGFloat(KeyboardSettings.topBarHeight)
 
     // State
     private var lang: Lang = .chinese
@@ -42,6 +44,9 @@ final class DemoKeyboardViewController: UIInputViewController {
     private var cancelArmed = false
     private var micDownAt = Date.distantPast
     private var ignoreMicUp = false
+    /// Latest partial recognized while the space press is still speculative (shown once confirmed).
+    private var speculativeText = ""
+    private var heightScale = 1.0
     // Live inline dictation: the partial text currently in the document.
     private var inlineText = ""
     private var inlineMarked = false
@@ -95,6 +100,8 @@ final class DemoKeyboardViewController: UIInputViewController {
     private let onDeviceSwitch = UISwitch()
     private let inlineCompatSwitch = UISwitch()
     private let layoutSegment = UISegmentedControl(items: ["九键", "全键盘"])
+    private let heightSlider = UISlider()
+    private let heightValueLabel = UILabel()
 
     private var isT9: Bool { lang == .chinese && layoutKind == .t9 }
     private var isFullPinyin: Bool { lang == .chinese && layoutKind == .qwerty }
@@ -137,16 +144,33 @@ final class DemoKeyboardViewController: UIInputViewController {
         view.addSubview(popup)
 
         dictation.onPartial = { [weak self] text in
-            guard let self, self.voiceTrigger != .none else { return }
-            self.setInline(text)
+            guard let self else { return }
+            switch self.voiceTrigger {
+            case .none: return
+            case .spaceSpeculative: self.speculativeText = text
+            default: self.setInline(text)
+            }
         }
         dictation.onLevel = { [weak self] rms in
-            guard let self, self.voiceTrigger != .none, self.voiceTrigger != .finishing else { return }
+            guard let self, self.voiceTrigger != .none, self.voiceTrigger != .finishing,
+                  self.voiceTrigger != .spaceSpeculative else { return }
             self.waveBar.setLevel(rms)
         }
         dictation.onListening = nil
-        dictation.onFinish = { [weak self] text in self?.voiceFinished(text) }
-        dictation.onFailure = { [weak self] message in self?.showStatus(message, duration: 3.5) }
+        dictation.onFinish = { [weak self] text in
+            guard let self else { return }
+            if self.voiceTrigger == .spaceSpeculative {
+                // Recognition ended before the hold was confirmed: keep the text for the hold, show nothing.
+                if let text, !text.isEmpty { self.speculativeText = text }
+                self.voiceTrigger = .none
+                return
+            }
+            self.voiceFinished(text)
+        }
+        dictation.onFailure = { [weak self] message in
+            guard let self, self.voiceTrigger != .spaceSpeculative else { return }
+            self.showStatus(message, duration: 3.5)
+        }
         dictation.attach(to: view)
 
         showStatus("词库加载中…", duration: 10)
@@ -184,7 +208,10 @@ final class DemoKeyboardViewController: UIInputViewController {
         spaceTimer?.invalidate()
         spaceTimer = nil
         deleteUp()
-        if voiceTrigger != .none {
+        if voiceTrigger == .spaceSpeculative {
+            voiceTrigger = .none
+            speculativeText = ""
+        } else if voiceTrigger != .none {
             // Keep whatever was already recognized in the document.
             voiceTrigger = .none
             commitInline(inlineText)
@@ -201,9 +228,7 @@ final class DemoKeyboardViewController: UIInputViewController {
 
     override func viewWillLayoutSubviews() {
         super.viewWillLayoutSubviews()
-        let screen = UIScreen.main.bounds
-        let target: CGFloat = screen.width > screen.height ? 206 : 266
-        if heightConstraint.constant != target { heightConstraint.constant = target }
+        applyHeight()
     }
 
     override func viewDidLayoutSubviews() {
@@ -229,8 +254,29 @@ final class DemoKeyboardViewController: UIInputViewController {
         updateReturnKeys()
     }
 
+    /// Sets the input view height from the height setting; every page lays its rows out from the
+    /// key area's bounds, so all of them scale with it.
+    private func applyHeight() {
+        let screen = UIScreen.main.bounds
+        let target = CGFloat(KeyboardSettings.keyboardHeight(landscape: screen.width > screen.height, scale: heightScale))
+        if heightConstraint.constant != target { heightConstraint.constant = target }
+    }
+
+    private func setHeightScale(_ value: Double, save: Bool) {
+        let r = KeyboardSettings.heightScaleRange
+        let v = (min(max(value, r.lowerBound), r.upperBound) * 20).rounded() / 20
+        heightScale = v
+        if save { KeyboardSettings.heightScale = v }
+        heightSlider.value = Float(v)
+        let pct = Int((v * 100).rounded())
+        heightValueLabel.text = pct == 100 ? "默认 100%" : "\(pct)%"
+        applyHeight()
+        view.setNeedsLayout()
+    }
+
     private func applySettings() {
         hapticsOn = KeyboardSettings.haptics
+        setHeightScale(KeyboardSettings.heightScale, save: false)
         let newLayout = KeyboardSettings.layout
         if newLayout != layoutKind {
             layoutKind = newLayout
@@ -326,7 +372,8 @@ final class DemoKeyboardViewController: UIInputViewController {
         layoutToggleButton = makeKey("", icon: "keyboard", style: .plain) { [weak self] in self?.toggleLayout() }
         let gear = makeKey("", icon: "gearshape", style: .plain) { [weak self] in self?.toggleSettings() }
         let hide = makeKey("", icon: "keyboard.chevron.compact.down", style: .plain) { [weak self] in self?.dismissKeyboard() }
-        let buttons = [mic, clip, layoutToggleButton!, gear, hide]
+        // 语音 | 九键/全键盘 | 剪贴板 | 设置 | 收起
+        let buttons = [mic, layoutToggleButton!, clip, gear, hide]
         buttons.forEach { toolbar.addSubview($0) }
         toolbar.layout = { v in
             let slot = v.bounds.width / CGFloat(buttons.count)
@@ -346,7 +393,7 @@ final class DemoKeyboardViewController: UIInputViewController {
     }
 
     private func updateTopBar() {
-        let voice = voiceTrigger != .none
+        let voice = voiceTrigger != .none && voiceTrigger != .spaceSpeculative
         let composing = !compose.isEmpty
         waveBar.isHidden = !voice
         candidateBar.isHidden = voice || !composing
@@ -647,6 +694,25 @@ final class DemoKeyboardViewController: UIInputViewController {
         let prewarmLabel = label("麦克风预热（会一直占用麦克风）")
         let onDeviceLabel = label("离线识别优先（更快，不可用时自动联网）")
         let inlineLabel = label("语音上屏兼容模式（逐段替换）")
+        let heightLabel = label("键盘高度")
+        heightSlider.minimumValue = Float(KeyboardSettings.heightScaleRange.lowerBound)
+        heightSlider.maximumValue = Float(KeyboardSettings.heightScaleRange.upperBound)
+        heightSlider.isContinuous = true
+        heightSlider.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            // Live preview: the keyboard resizes while dragging; saved on every change.
+            self.setHeightScale(Double(self.heightSlider.value), save: true)
+        }, for: .valueChanged)
+        heightValueLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .regular)
+        heightValueLabel.textColor = .secondaryLabel
+        heightValueLabel.textAlignment = .center
+        heightValueLabel.adjustsFontSizeToFitWidth = true
+        let heightReset = makeKey("默认", style: .function, size: 13) { [weak self] in
+            self?.setHeightScale(1.0, save: true)
+        }
+        let heightControl = UIView()
+        [heightSlider, heightValueLabel, heightReset].forEach { heightControl.addSubview($0) }
+        let slider = heightSlider, valueLabel = heightValueLabel
         inlineCompatSwitch.addAction(UIAction { [weak self] _ in
             guard let self else { return }
             KeyboardSettings.inlineCompat = self.inlineCompatSwitch.isOn
@@ -673,26 +739,42 @@ final class DemoKeyboardViewController: UIInputViewController {
             self.dictation.prewarm(hasFullAccess: self.hasFullAccess, micWarm: KeyboardSettings.micPrewarm, onDevice: self.onDeviceSwitch.isOn)
         }, for: .valueChanged)
         let rows: [(UILabel, UIView)] = [
+            (heightLabel, heightControl),
             (layoutLabel, layoutSegment), (hapticLabel, hapticSwitch), (prewarmLabel, prewarmSwitch), (onDeviceLabel, onDeviceSwitch),
             (inlineLabel, inlineCompatSwitch),
         ]
-        ([title, done] as [UIView]).forEach { settingsPanel.addSubview($0) }
+        // Rows scroll, so the panel works at every keyboard height.
+        let scroll = TouchScrollView()
+        scroll.alwaysBounceVertical = true
+        ([title, done, scroll] as [UIView]).forEach { settingsPanel.addSubview($0) }
         for (l, c) in rows {
-            settingsPanel.addSubview(l)
-            settingsPanel.addSubview(c)
+            scroll.addSubview(l)
+            scroll.addSubview(c)
         }
         settingsPanel.layout = { v in
             let w = v.bounds.width
             title.frame = CGRect(x: 12, y: 0, width: 160, height: 32)
             done.frame = CGRect(x: w - 4 - 60, y: 2, width: 60, height: 28)
-            let rowH = max(36, floor((v.bounds.height - 40) / CGFloat(rows.count)))
+            scroll.frame = CGRect(x: 0, y: 36, width: w, height: max(0, v.bounds.height - 36))
+            let rowH = max(40, floor(scroll.bounds.height / CGFloat(rows.count)))
             for (i, (l, c)) in rows.enumerated() {
-                let y = 38 + CGFloat(i) * rowH
+                let y = CGFloat(i) * rowH
+                if c === heightControl {
+                    l.frame = CGRect(x: 14, y: y, width: 64, height: rowH)
+                    let cx: CGFloat = 80
+                    c.frame = CGRect(x: cx, y: y, width: w - 12 - cx, height: rowH)
+                    let cw = c.bounds.width
+                    heightReset.frame = CGRect(x: cw - 50, y: (rowH - 28) / 2, width: 50, height: 28)
+                    valueLabel.frame = CGRect(x: cw - 50 - 6 - 70, y: 0, width: 70, height: rowH)
+                    slider.frame = CGRect(x: 0, y: (rowH - 31) / 2, width: max(60, cw - 50 - 6 - 70 - 6), height: 31)
+                    continue
+                }
                 let cw: CGFloat = c is UISegmentedControl ? 150 : 51
                 let ch: CGFloat = c is UISegmentedControl ? 30 : 31
                 c.frame = CGRect(x: w - 12 - cw, y: y + (rowH - ch) / 2, width: cw, height: ch)
                 l.frame = CGRect(x: 14, y: y, width: w - 40 - cw, height: rowH)
             }
+            scroll.contentSize = CGSize(width: w, height: rowH * CGFloat(rows.count))
         }
     }
 
@@ -1123,23 +1205,74 @@ final class DemoKeyboardViewController: UIInputViewController {
         spaceHoldFired = false
         cancelArmed = false
         spaceTimer?.invalidate()
+        // Microphone + recognizer start right now, before the hold is confirmed, so the first
+        // syllable is captured. Nothing is shown or inserted until the hold threshold passes.
+        startSpeculativeVoice()
         let timer = Timer(timeInterval: KeyboardSettings.holdDelay, target: self, selector: #selector(spaceHoldFire), userInfo: nil, repeats: false)
         RunLoop.main.add(timer, forMode: .common)
         spaceTimer = timer
     }
 
+    private func startSpeculativeVoice() {
+        guard voiceTrigger == .none,
+              dictation.permissionProblem(hasFullAccess: hasFullAccess) == nil,
+              dictation.capture.isReady else { return }
+        inlineText = ""
+        inlineMarked = false
+        speculativeText = ""
+        inlineCompatMode = KeyboardSettings.inlineCompat
+        voiceTrigger = .spaceSpeculative
+        if !dictation.begin(), voiceTrigger == .spaceSpeculative { voiceTrigger = .none }
+    }
+
+    /// Short tap: stop the speculative capture at once (mic freed, no text).
+    private func cancelSpeculativeVoice() {
+        guard voiceTrigger == .spaceSpeculative else { return }
+        voiceTrigger = .none
+        speculativeText = ""
+        dictation.cancel()
+        updateTopBar()
+    }
+
     @objc private func spaceHoldFire() {
         spaceTimer = nil
+        if voiceTrigger == .spaceSpeculative, dictation.isActive {
+            spaceHoldFired = true
+            confirmSpeculativeVoice()
+            return
+        }
+        if voiceTrigger == .spaceSpeculative { voiceTrigger = .none }
         guard voiceTrigger == .none else { return }
         spaceHoldFired = true
         commitAll()
+        // Text recognized by a speculative run that ended early is kept.
+        if !speculativeText.isEmpty { textDocumentProxy.insertText(speculativeText) }
+        speculativeText = ""
         startVoice(.spaceHold)
+    }
+
+    /// The hold passed the threshold: the running capture becomes a normal hold-to-talk dictation.
+    private func confirmSpeculativeVoice() {
+        commitAll()
+        hidePopup()
+        hidePanels()
+        voiceTrigger = .spaceHold
+        if hapticsOn {
+            startHaptic.impactOccurred()
+            startHaptic.prepare()
+        }
+        waveBar.start()
+        updateTopBar()
+        if !speculativeText.isEmpty { setInline(speculativeText) }
+        speculativeText = ""
     }
 
     private func spaceUp(inside: Bool) {
         if let timer = spaceTimer {
             timer.invalidate()
             spaceTimer = nil
+            // Released before the threshold: free the microphone first, then a normal space.
+            cancelSpeculativeVoice()
             if inside { tapSpace() }
             return
         }

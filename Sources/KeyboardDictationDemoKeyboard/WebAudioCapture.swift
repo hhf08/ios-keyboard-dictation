@@ -242,7 +242,7 @@ final class WebAudioCapture: NSObject {
           l.context = context;
           await context.resume();
           if (live !== l) return;
-          const processor = context.createScriptProcessor(512, 1, 1);
+          const processor = context.createScriptProcessor(256, 1, 1);
           const sink = context.createGain();
           sink.gain.value = 0;
           processor.connect(sink);

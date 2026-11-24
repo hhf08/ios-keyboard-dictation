@@ -205,7 +205,7 @@ final class TouchScrollView: UIScrollView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    override func touchesShouldCancel(in view: UIView) -> Bool { true }
+    override func touchesShouldCancel(in view: UIView) -> Bool { !(view is UISlider) }
 }
 
 /// A view that lays out its children with a closure.
