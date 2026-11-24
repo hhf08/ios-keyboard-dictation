@@ -21,7 +21,10 @@
  *
  */
 
+import AVFoundation
+import Speech
 import UIKit
+import WebKit
 // Full keyboard extension entry point.
 // Implements IMService behavior per IM_SERVICE.md spec.
 
@@ -38,6 +41,18 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
 
     // MARK: - Components
     private var candidateBar: CandidateBarView!
+
+    // MARK: - Voice input (hold space to talk)
+    private lazy var voiceCapture = VoiceWebAudioCapture()
+    private var voiceCaptureAttached = false
+    private let voiceRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN"))
+    private var voiceRequest: SFSpeechAudioBufferRecognitionRequest?
+    private var voiceTask: SFSpeechRecognitionTask?
+    private var voiceInsertedPartial = ""
+    private var voiceWantsStart = false
+    private let voiceAudioFormat = AVAudioFormat(commonFormat: .pcmFormatInt16,
+                                                 sampleRate: VoiceWebAudioCapture.sampleRate,
+                                                 channels: 1, interleaved: true)!
     private var keyboardView:  KeyboardView!
     private var emojiPanelView: EmojiPanelView?
     private var emojiPanelSource: EmojiPanelSource = .english
@@ -551,6 +566,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
         isKeyboardVisible = false
+        if voiceCaptureAttached && voiceCapture.isCapturing { voiceCapture.stop() }
         keyboardView?.cancelActiveInteractions()
         dismissPopupKeyboard()
         // Detach window-attached composing popup so it doesn't linger after
@@ -4243,7 +4259,7 @@ extension KeyboardViewController: KeyboardViewDelegate {
         }
         // Space key: show LIME-internal IM picker only (spec §10: NOT iOS keyboard switch)
         else if keyDef.code == LimeKeyCode.space.rawValue {
-            showLimeIMPicker()
+            beginVoiceInput()
         }
     }
 
@@ -6306,3 +6322,315 @@ extension KeyboardViewController {
     var _testSelectedCandidateWord: String? { selectedCandidate?.word }
 }
 #endif
+
+
+// MARK: - Voice input
+
+extension KeyboardViewController {
+    func keyboardViewDidEndSpaceLongPress(_ view: KeyboardView) {
+        voiceWantsStart = false
+        if voiceCaptureAttached && voiceCapture.isCapturing {
+            voiceCapture.stop()
+        } else if voiceRequest != nil {
+            voiceRequest?.endAudio()
+        }
+    }
+
+    fileprivate func attachVoiceCaptureIfNeeded() {
+        guard !voiceCaptureAttached else { return }
+        voiceCaptureAttached = true
+        voiceCapture.onReady = { [weak self] in
+            guard let self, self.voiceWantsStart else { return }
+            self.startVoiceCapture()
+        }
+        voiceCapture.onStarted = { [weak self] in self?.showLimeToast("🎤 正在聆听…松开结束", persistent: true) }
+        voiceCapture.onAudio = { [weak self] data, _ in self?.appendVoiceAudio(data) }
+        voiceCapture.onEnded = { [weak self] reason in self?.voiceCaptureEnded(reason) }
+        voiceCapture.attach(to: view)
+    }
+
+    fileprivate func beginVoiceInput() {
+        guard hasFullAccess else {
+            return showLimeToast("请在 设置→通用→键盘 中为 LIME 打开「允许完全访问」")
+        }
+        guard AVAudioSession.sharedInstance().recordPermission == .granted,
+              SFSpeechRecognizer.authorizationStatus() == .authorized else {
+            return showLimeToast("请打开 LIME App，在「语音输入」中授予麦克风和语音识别权限")
+        }
+        guard let voiceRecognizer, voiceRecognizer.isAvailable else {
+            return showLimeToast("语音识别暂时不可用")
+        }
+        // Settle any in-progress composing before dictation inserts text.
+        if !mComposing.isEmpty {
+            if selectedCandidate != nil { commitTyped() } else { cancelComposing() }
+        }
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        voiceWantsStart = true
+        attachVoiceCaptureIfNeeded()
+        if voiceCapture.isReady {
+            startVoiceCapture()
+        } else {
+            showLimeToast("🎤 准备麦克风…", persistent: true)
+        }
+    }
+
+    private func startVoiceCapture() {
+        guard voiceWantsStart, !voiceCapture.isCapturing, let voiceRecognizer else { return }
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        if #available(iOS 16.0, *) { request.addsPunctuation = true }
+        voiceRequest = request
+        voiceInsertedPartial = ""
+        voiceTask = voiceRecognizer.recognitionTask(with: request) { [weak self] result, error in
+            DispatchQueue.main.async { self?.handleVoice(result: result, error: error) }
+        }
+        voiceCapture.start()
+        showLimeToast("🎤 正在聆听…松开结束", persistent: true)
+    }
+
+    private func appendVoiceAudio(_ data: Data) {
+        let frames = AVAudioFrameCount(data.count / 2)
+        guard frames > 0, let request = voiceRequest,
+              let buffer = AVAudioPCMBuffer(pcmFormat: voiceAudioFormat, frameCapacity: frames) else { return }
+        buffer.frameLength = frames
+        data.withUnsafeBytes { raw in
+            if let base = raw.bindMemory(to: Int16.self).baseAddress {
+                buffer.int16ChannelData![0].update(from: base, count: Int(frames))
+            }
+        }
+        request.append(buffer)
+    }
+
+    private func voiceCaptureEnded(_ reason: String) {
+        voiceRequest?.endAudio()
+        if reason != "stopped" { showLimeToast("麦克风：\(reason)") }
+        else if voiceRequest != nil { showLimeToast("识别中…", persistent: true) }
+    }
+
+    private func handleVoice(result: SFSpeechRecognitionResult?, error: Error?) {
+        if let result {
+            replaceVoicePartial(with: result.bestTranscription.formattedString)
+            if result.isFinal { finishVoice(message: nil) }
+        } else if let error {
+            finishVoice(message: voiceInsertedPartial.isEmpty ? "没有识别到语音（\(error.localizedDescription)）" : nil)
+        }
+    }
+
+    private func replaceVoicePartial(with text: String) {
+        guard text != voiceInsertedPartial else { return }
+        let common = zip(voiceInsertedPartial, text).prefix { $0 == $1 }.count
+        isSelfUpdate = true
+        for _ in 0..<(voiceInsertedPartial.count - common) { textDocumentProxy.deleteBackward() }
+        textDocumentProxy.insertText(String(text.dropFirst(common)))
+        isSelfUpdate = false
+        voiceInsertedPartial = text
+    }
+
+    private func finishVoice(message: String?) {
+        voiceTask = nil
+        voiceRequest = nil
+        voiceInsertedPartial = ""
+        if let message { showLimeToast(message) } else { hideLimeToast() }
+    }
+}
+
+/// Captures microphone audio from inside a keyboard extension by running `getUserMedia`
+/// in a hidden `WKWebView`. WebKit performs the capture in its own processes, which avoids
+/// the keyboard-process audio restrictions that break `AVAudioEngine` / `AudioQueue`.
+///
+/// Emits 16 kHz mono Int16 PCM chunks through `onAudio`.
+@MainActor
+final class VoiceWebAudioCapture: NSObject {
+    static let sampleRate: Double = 16_000
+
+    var onReady: (() -> Void)?
+    var onStarted: (() -> Void)?
+    var onAudio: ((Data, Float) -> Void)?
+    var onEnded: ((String) -> Void)?
+
+    private(set) var isReady = false
+    private(set) var isCapturing = false
+    private let webView: WKWebView
+    private var heartbeat: Timer?
+
+    override init() {
+        let configuration = WKWebViewConfiguration()
+        configuration.allowsInlineMediaPlayback = true
+        configuration.mediaTypesRequiringUserActionForPlayback = []
+        configuration.websiteDataStore = .nonPersistent()
+        webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 1, height: 1), configuration: configuration)
+        super.init()
+        configuration.userContentController.add(VoiceWeakMessageHandler(self), name: "capture")
+        webView.uiDelegate = self
+        webView.navigationDelegate = self
+        webView.alpha = 0.01
+        webView.isUserInteractionEnabled = false
+        webView.accessibilityElementsHidden = true
+    }
+
+    /// The web view must live in the keyboard's view hierarchy for WebKit to capture.
+    func attach(to view: UIView) {
+        view.addSubview(webView)
+        view.sendSubviewToBack(webView)
+        // https base URL gives the page a secure context, which getUserMedia requires.
+        webView.loadHTMLString(Self.page, baseURL: URL(string: "https://keyboard-dictation.invalid/"))
+    }
+
+    func start() {
+        guard isReady, !isCapturing else { return }
+        isCapturing = true
+        heartbeat = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.webView.evaluateJavaScript("captureHeartbeat()") }
+        }
+        webView.evaluateJavaScript("startCapture(); 0") { [weak self] _, error in
+            if let error { Task { @MainActor in self?.finish(reason: "start failed: \(error.localizedDescription)") } }
+        }
+    }
+
+    func stop() {
+        guard isCapturing else { return }
+        webView.evaluateJavaScript("stopCapture(); 0")
+        finish(reason: "stopped")
+    }
+
+    func tearDown() {
+        stop()
+        webView.stopLoading()
+        webView.configuration.userContentController.removeScriptMessageHandler(forName: "capture")
+        webView.removeFromSuperview()
+    }
+
+    private func finish(reason: String) {
+        heartbeat?.invalidate()
+        heartbeat = nil
+        guard isCapturing else { return }
+        isCapturing = false
+        onEnded?(reason)
+    }
+
+    fileprivate func handle(_ body: Any) {
+        guard let message = body as? [String: Any], let type = message["type"] as? String else { return }
+        switch type {
+        case "ready":
+            isReady = true
+            onReady?()
+        case "started":
+            onStarted?()
+        case "audio":
+            guard isCapturing, let base64 = message["data"] as? String, let data = Data(base64Encoded: base64) else { return }
+            onAudio?(data, (message["rms"] as? NSNumber)?.floatValue ?? 0)
+        case "interrupted", "failed":
+            finish(reason: "\(type): \(message["reason"] as? String ?? "unknown")")
+        default:
+            break
+        }
+    }
+
+    private static let page = """
+    <!doctype html><html><body><script>
+    const targetRate = \(Int(sampleRate));
+    const post = message => window.webkit.messageHandlers.capture.postMessage(message);
+    const encode = samples => {
+      const bytes = new Uint8Array(samples.buffer, 0, samples.length * 2);
+      let binary = '';
+      for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+      return btoa(binary);
+    };
+    let lastHeartbeat = performance.now();
+    window.captureHeartbeat = () => { lastHeartbeat = performance.now(); };
+    let stopCapture = () => {};
+    window.stopCapture = () => stopCapture();
+    window.startCapture = async () => {
+      let stopping = false, stream, context, source, processor, sink, watchdog;
+      const audioSession = navigator.audioSession;
+      const previousType = audioSession?.type ?? 'auto';
+      const cleanup = () => {
+        if (stopping) return;
+        stopping = true;
+        clearInterval(watchdog);
+        if (processor) { processor.onaudioprocess = null; processor.disconnect(); }
+        source?.disconnect();
+        sink?.disconnect();
+        stream?.getTracks().forEach(track => track.stop());
+        context?.close().catch(() => {});
+        try { if (audioSession) audioSession.type = previousType; } catch (_) {}
+      };
+      const interrupted = reason => { if (!stopping) { cleanup(); post({ type: 'interrupted', reason }); } };
+      stopCapture = cleanup;
+      try {
+        try { if (audioSession) audioSession.type = 'play-and-record'; } catch (_) {}
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        });
+        if (stopping) { stream.getTracks().forEach(track => track.stop()); return; }
+        const track = stream.getAudioTracks()[0];
+        track.onended = () => interrupted('track-ended');
+        // Defer the AudioContext until capture: creating one can take audio focus.
+        context = new AudioContext({ latencyHint: 'interactive' });
+        await context.resume();
+        processor = context.createScriptProcessor(1024, 1, 1);
+        sink = context.createGain();
+        sink.gain.value = 0;
+        processor.connect(sink);
+        sink.connect(context.destination);
+        source = context.createMediaStreamSource(stream);
+        source.connect(processor);
+        context.onstatechange = () => { if (context.state !== 'running') interrupted('context-' + context.state); };
+        if (audioSession) audioSession.onstatechange = () => { if (audioSession.state === 'interrupted') interrupted('audio-session-interrupted'); };
+        lastHeartbeat = performance.now();
+        watchdog = setInterval(() => { if (performance.now() - lastHeartbeat > 3000) interrupted('native-heartbeat-expired'); }, 500);
+        const step = context.sampleRate / targetRate;
+        let position = 0, sum = 0, count = 0;
+        processor.onaudioprocess = event => {
+          const input = event.inputBuffer.getChannelData(0);
+          const output = new Int16Array(Math.ceil(input.length / step) + 1);
+          let written = 0, energy = 0;
+          for (const sample of input) {
+            energy += sample * sample; sum += sample; count += 1; position += 1;
+            if (position >= step) {
+              position -= step;
+              output[written++] = Math.max(-1, Math.min(1, sum / count)) * 32767;
+              sum = 0; count = 0;
+            }
+          }
+          if (written > 0) post({ type: 'audio', data: encode(output.subarray(0, written)), rms: Math.sqrt(energy / input.length) });
+        };
+        post({ type: 'started', sampleRate: context.sampleRate });
+      } catch (error) {
+        if (stopping) return;
+        cleanup();
+        post({ type: 'failed', reason: error.name + ': ' + error.message });
+      }
+    };
+    post({ type: 'ready' });
+    </script></body></html>
+    """
+}
+
+extension VoiceWebAudioCapture: WKUIDelegate, WKNavigationDelegate {
+    func webView(
+        _ webView: WKWebView,
+        requestMediaCapturePermissionFor origin: WKSecurityOrigin,
+        initiatedByFrame frame: WKFrameInfo,
+        type: WKMediaCaptureType,
+        decisionHandler: @escaping (WKPermissionDecision) -> Void
+    ) {
+        decisionHandler(type == .microphone ? .grant : .deny)
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        isReady = false
+        finish(reason: "web content process terminated")
+        webView.loadHTMLString(Self.page, baseURL: URL(string: "https://keyboard-dictation.invalid/"))
+    }
+}
+
+/// Breaks the retain cycle between `WKUserContentController` and its handler.
+private final class VoiceWeakMessageHandler: NSObject, WKScriptMessageHandler {
+    weak var target: VoiceWebAudioCapture?
+    init(_ target: VoiceWebAudioCapture) { self.target = target }
+
+    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+        MainActor.assumeIsolated { target?.handle(message.body) }
+    }
+}

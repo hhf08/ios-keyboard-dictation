@@ -182,6 +182,7 @@ protocol KeyboardViewDelegate: AnyObject {
     /// SPLIT_ONE_HAND_KB: user tapped the restore chevron shown in the strip vacated by
     /// one-hand/numpad anchoring — host should reset to full width and persist the change.
     func keyboardViewDidTapOneHandRestore()
+    func keyboardViewDidEndSpaceLongPress(_ view: KeyboardView)
 }
 
 extension KeyboardViewDelegate {
@@ -192,6 +193,8 @@ extension KeyboardViewDelegate {
     /// Default no-op so existing conformers (test mocks, etc.) compile unchanged; the real host
     /// (KeyboardViewController) overrides this to restore full width (SPLIT_ONE_HAND_KB).
     func keyboardViewDidTapOneHandRestore() {}
+    /// Voice input: the space key was released (or cancelled) after a long press.
+    func keyboardViewDidEndSpaceLongPress(_ view: KeyboardView) {}
 }
 
 final class KeyboardView: UIView, UIInputViewAudioFeedback {
@@ -1669,6 +1672,9 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
             Prof.event("TouchCancel", "touch=\(touchID)")
             touchTrackers.removeValue(forKey: touchID)
             let state = ownerTouchStates.removeValue(forKey: touchID)
+            if state?.behavior == .space, state?.spaceTapSuppressed == true {
+                delegate?.keyboardViewDidEndSpaceLongPress(self)
+            }
             if let target = plainTouchTargets.removeValue(forKey: touchID) {
                 cancelPlainKeyTouch(button: target.button, keyDef: target.keyDef)
             }
@@ -1934,6 +1940,9 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
 
     private func endSpaceTouch(state: OwnerTouchState) {
         state.target.button.backgroundColor = restoredKeyBackgroundColor(for: state.target.keyDef)
+        if state.spaceTapSuppressed {
+            delegate?.keyboardViewDidEndSpaceLongPress(self)
+        }
         if !state.spaceTapSuppressed {
             fireHaptic()
             if feedbackSound { playKeyClickSound() }

@@ -27,6 +27,8 @@
 // Root 5-tab TabView. Hosted via UIHostingController from MainViewController.
 // Replaces the old 4-tab version per spec §2.
 
+import AVFoundation
+import Speech
 import SwiftUI
 import UIKit
 
@@ -153,6 +155,10 @@ struct LimeSettingsView: View {
             DBManagerView()
                 .tabItem { Label("資料庫", systemImage: "archivebox") }
                 .tag(4)
+
+            VoiceInputSettingsView()
+                .tabItem { Label("语音", systemImage: "mic") }
+                .tag(5)
         }
         // iOS 18 introduces a "floating tab bar" at the top of the iPad screen
         // by default. When a child view uses `.searchable`, SwiftUI hoists the
@@ -519,5 +525,51 @@ extension View {
         @ViewBuilder trailing: @escaping () -> Trailing
     ) -> some View {
         modifier(ConstrainedDetailLayout(title: title, trailing: trailing))
+    }
+}
+
+
+// MARK: - Voice input settings (hold space to talk)
+
+struct VoiceInputSettingsView: View {
+    @State private var microphone = AVAudioSession.sharedInstance().recordPermission
+    @State private var speech = SFSpeechRecognizer.authorizationStatus()
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("权限") {
+                    LabeledContent("麦克风", value: microphone == .granted ? "已允许" : (microphone == .denied ? "已拒绝" : "未请求"))
+                    LabeledContent("语音识别", value: speech == .authorized ? "已允许" : (speech == .denied ? "已拒绝" : "未请求"))
+                    Button("授予麦克风和语音识别权限", action: requestPermissions)
+                    Button("打开系统设置") {
+                        if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
+                    }
+                }
+                Section("使用方法") {
+                    Text("1. 设置 → 通用 → 键盘 → 键盘 → LIME，打开「允许完全访问」。")
+                    Text("2. 在 LIME 键盘上长按空格键，震动后开始说普通话，松开即结束，文字自动输入。")
+                    Text("3. 切换 LIME 输入法请用候选栏的 ☰ 菜单。")
+                    Text("语音识别由 Apple 提供，可能需要联网。")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                }
+            }
+            .navigationTitle("语音输入")
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in refresh() }
+    }
+
+    private func refresh() {
+        microphone = AVAudioSession.sharedInstance().recordPermission
+        speech = SFSpeechRecognizer.authorizationStatus()
+    }
+
+    private func requestPermissions() {
+        AVAudioSession.sharedInstance().requestRecordPermission { _ in
+            SFSpeechRecognizer.requestAuthorization { _ in
+                DispatchQueue.main.async { refresh() }
+            }
+        }
     }
 }
