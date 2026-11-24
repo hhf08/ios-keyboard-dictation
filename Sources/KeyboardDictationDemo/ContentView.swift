@@ -32,7 +32,7 @@ struct ContentView: View {
                 Section("第三步：试一试") {
                     TextField("在这里切换到语音键盘试试", text: $text, axis: .vertical)
                         .lineLimit(3...8)
-                    Text("九宫格拼音：按字母键打拼音，点上方候选词上屏，空格选第一个候选，上方一排可选具体拼音。「123」切换数字。点「🎤 语音」说普通话，说完点「停止」，文字自动输入。")
+                    Text("九宫格拼音：按字母键打拼音，点上方候选词上屏，空格选第一个候选，上方一排可选具体拼音。「符号」打开标点符号页（中文、英文、表情），「123」切换数字。长按空格键说普通话，松开即结束，文字自动输入。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }

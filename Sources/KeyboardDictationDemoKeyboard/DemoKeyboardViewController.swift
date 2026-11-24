@@ -34,7 +34,10 @@ final class DemoKeyboardViewController: UIInputViewController {
     private let candidateScroll = UIScrollView()
     private let candidateStack = UIStackView()
     private let gridStack = UIStackView()
-    private let micButton = UIButton(type: .system)
+    private let symbolPanel = UIView()
+    private var zeroButton: UIButton!
+    private var symbolButton: UIButton!
+    private var spaceHint = "长按空格说话，松开结束"
     private var modeButton: UIButton!
     private var spaceButton: UIButton!
     private var returnButton: UIButton!
@@ -122,7 +125,7 @@ final class DemoKeyboardViewController: UIInputViewController {
         let seconds = Double(capturedSamples) / WebAudioCapture.sampleRate
         let level = String(repeating: "▮", count: min(Int(rms * 60), 10))
         setStatus(String(format: "录音 %.1f 秒 %@", seconds, level) + (speechError.map { " · 识别：\($0)" } ?? ""))
-        micButton.alpha = 0.6 + CGFloat(min(rms * 8, 0.4))
+        spaceButton.alpha = 0.6 + CGFloat(min(rms * 8, 0.4))
 
         guard let request, let buffer = AVAudioPCMBuffer(pcmFormat: audioFormat, frameCapacity: frames) else { return }
         buffer.frameLength = frames
@@ -240,7 +243,8 @@ final class DemoKeyboardViewController: UIInputViewController {
         candidates = engine.isLoaded ? engine.candidates(for: digits, pinyinFilter: pinyinFilter) : []
         rebuildPinyinBar()
         rebuildCandidateBar()
-        spaceButton?.setTitle(digits.isEmpty ? "空格" : "确定", for: .normal)
+        if !capture.isCapturing { spaceButton?.setTitle(digits.isEmpty ? "空格" : "确定", for: .normal) }
+        if digits.isEmpty, statusLabel.text?.isEmpty ?? true { setStatus(spaceHint) }
         returnButton?.setTitle(digits.isEmpty ? "换行" : "英文", for: .normal)
     }
 
@@ -360,12 +364,13 @@ final class DemoKeyboardViewController: UIInputViewController {
             }
             rows.append(row(keys))
         }
-        let zeroKey = makeKey("0") { [weak self] in
-            guard let self else { return }
-            if self.mode == .number { self.textDocumentProxy.insertText("0") } else { self.insertSymbol("…") }
-        }
-        digitKeys.append(zeroKey)
+        let zeroKey = makeKey("0") { [weak self] in self?.textDocumentProxy.insertText("0") }
+        zeroButton = zeroKey
+        symbolButton = makeKey("符号", dark: true, font: .systemFont(ofSize: 15)) { [weak self] in self?.showSymbols(true) }
         spaceButton = makeKey("空格") { [weak self] in self?.tapSpace() }
+        let longPress = UILongPressGestureRecognizer(target: self, action: #selector(spaceLongPress(_:)))
+        longPress.minimumPressDuration = 0.35
+        spaceButton.addGestureRecognizer(longPress)
         let globe = UIButton(type: .system)
         globe.setImage(UIImage(systemName: "globe"), for: .normal)
         globe.tintColor = .label
@@ -373,24 +378,21 @@ final class DemoKeyboardViewController: UIInputViewController {
         globe.layer.cornerRadius = 6
         globe.addTarget(self, action: #selector(handleInputModeList(from:with:)), for: .allTouchEvents)
         globe.isHidden = !needsInputModeSwitchKey
-        let bottomMiddle = row([globe, zeroKey, spaceButton], equal: false)
-        zeroKey.widthAnchor.constraint(equalTo: spaceButton.widthAnchor, multiplier: 0.5).isActive = true
-        let globeWidth = globe.widthAnchor.constraint(equalTo: zeroKey.widthAnchor)
-        globeWidth.priority = .defaultHigh
-        globeWidth.isActive = true
+        let bottomMiddle = row([globe, symbolButton, spaceButton, zeroKey], equal: false)
+        for small in [globe, symbolButton!, zeroKey] {
+            let w = small.widthAnchor.constraint(equalTo: spaceButton.widthAnchor, multiplier: 0.4)
+            w.priority = .defaultHigh
+            w.isActive = true
+        }
+        zeroKey.isHidden = true
         rows.append(bottomMiddle)
         let middle = column(rows)
 
         // Right: delete, clear, mic, return
         let deleteKey = makeKey("⌫", dark: true) { [weak self] in self?.tapDelete() }
         let clearKey = makeKey("重输", dark: true, font: .systemFont(ofSize: 15)) { [weak self] in self?.clearComposition() }
-        micButton.setTitle("🎤 语音", for: .normal)
-        micButton.titleLabel?.font = .systemFont(ofSize: 14, weight: .semibold)
-        micButton.setTitleColor(.white, for: .normal)
-        micButton.layer.cornerRadius = 6
-        micButton.addTarget(self, action: #selector(toggleDictation), for: .touchUpInside)
         returnButton = makeKey("换行", dark: true, font: .systemFont(ofSize: 15)) { [weak self] in self?.tapReturn() }
-        let right = column([deleteKey, clearKey, micButton, returnButton])
+        let right = column([deleteKey, clearKey, returnButton])
 
         let main = row([left, middle, right], equal: false)
         left.widthAnchor.constraint(equalTo: middle.widthAnchor, multiplier: 0.2).isActive = true
@@ -435,6 +437,7 @@ final class DemoKeyboardViewController: UIInputViewController {
 
             main.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -6),
         ])
+        configureSymbolPanel(over: main)
         updateKeyLabels()
     }
 
@@ -450,22 +453,134 @@ final class DemoKeyboardViewController: UIInputViewController {
                     b.titleLabel?.font = .systemFont(ofSize: 17)
                 }
             } else {
-                b.setTitle(mode == .number ? "0" : "…", for: .normal)
+                b.setTitle("0", for: .normal)
             }
         }
         modeButton?.setTitle(mode == .number ? "拼音" : "123", for: .normal)
+        zeroButton?.isHidden = mode != .number
     }
 
     private func render() {
         if capture.isCapturing {
-            micButton.setTitle("■ 停止", for: .normal)
-            micButton.backgroundColor = .systemRed
+            spaceButton?.setTitle("🎤 松开结束", for: .normal)
+            spaceButton?.backgroundColor = .systemBlue
+            spaceButton?.setTitleColor(.white, for: .normal)
         } else {
-            micButton.alpha = 1
-            micButton.setTitle(capture.isReady ? "🎤 语音" : "加载中", for: .normal)
-            micButton.backgroundColor = capture.isReady ? .systemBlue : .systemGray
-            micButton.isEnabled = capture.isReady
+            spaceButton?.alpha = 1
+            spaceButton?.backgroundColor = .systemBackground
+            spaceButton?.setTitleColor(.label, for: .normal)
+            spaceButton?.setTitle(digits.isEmpty ? "空格" : "确定", for: .normal)
         }
+    }
+
+    @objc private func spaceLongPress(_ g: UILongPressGestureRecognizer) {
+        switch g.state {
+        case .began:
+            if !digits.isEmpty {
+                if let first = candidates.first { commit(first) } else { clearComposition() }
+                digits = ""
+                refreshCandidates()
+            }
+            guard capture.isReady else { return setStatus("语音模块加载中，请稍后再试") }
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            startDictation()
+        case .ended, .cancelled, .failed:
+            if capture.isCapturing { stopDictation() }
+        default:
+            break
+        }
+    }
+
+    // MARK: - Symbols page
+
+    private let symbolGroups: [(String, [String])] = [
+        ("中文", ["，", "。", "？", "！", "、", "：", "；", "“", "”", "‘", "’", "（", "）", "《", "》", "〈", "〉", "【", "】", "「", "」", "『", "』", "—", "……", "·", "～", "￥", "％", "＃", "＆", "＊", "＠", "→", "←", "↑", "↓", "√", "×", "÷", "℃", "°", "№", "§", "※", "○", "●", "△", "□", "☆", "★", "♀", "♂"]),
+        ("英文", [",", ".", "?", "!", ":", ";", "'", "\"", "(", ")", "[", "]", "{", "}", "<", ">", "-", "_", "+", "=", "/", "\\", "|", "~", "`", "@", "#", "$", "%", "^", "&", "*", "€", "£", "¥", "•"]),
+        ("表情", ["😀", "😂", "🤣", "😊", "😍", "😘", "😭", "😅", "🤔", "😎", "😡", "😱", "👍", "👏", "🙏", "💪", "❤️", "🎉", "🔥", "🌹", "😴", "🙄", "😉", "🤗", "😢", "👌", "✌️", "💯", "^_^", "(*^▽^*)", "o(╥﹏╥)o", "(￣▽￣)"]),
+    ]
+    private let symbolScroll = UIScrollView()
+    private let symbolGrid = UIStackView()
+    private var symbolTabButtons: [UIButton] = []
+
+    private func configureSymbolPanel(over main: UIView) {
+        symbolPanel.backgroundColor = UIColor.systemGray5
+        symbolPanel.isHidden = true
+        symbolPanel.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(symbolPanel)
+        NSLayoutConstraint.activate([
+            symbolPanel.topAnchor.constraint(equalTo: main.topAnchor),
+            symbolPanel.bottomAnchor.constraint(equalTo: main.bottomAnchor),
+            symbolPanel.leadingAnchor.constraint(equalTo: main.leadingAnchor),
+            symbolPanel.trailingAnchor.constraint(equalTo: main.trailingAnchor),
+        ])
+
+        symbolGrid.axis = .vertical
+        symbolGrid.spacing = 6
+        symbolGrid.translatesAutoresizingMaskIntoConstraints = false
+        symbolScroll.translatesAutoresizingMaskIntoConstraints = false
+        symbolScroll.addSubview(symbolGrid)
+
+        let backKey = makeKey("返回", dark: true, font: .systemFont(ofSize: 15)) { [weak self] in self?.showSymbols(false) }
+        symbolTabButtons = symbolGroups.enumerated().map { i, group in
+            makeKey(group.0, dark: true, font: .systemFont(ofSize: 15)) { [weak self] in self?.selectSymbolGroup(i) }
+        }
+        let del = makeKey("⌫", dark: true) { [weak self] in self?.textDocumentProxy.deleteBackward() }
+        let bar = row([backKey] + symbolTabButtons + [del])
+        bar.translatesAutoresizingMaskIntoConstraints = false
+
+        symbolPanel.addSubview(symbolScroll)
+        symbolPanel.addSubview(bar)
+        NSLayoutConstraint.activate([
+            symbolScroll.topAnchor.constraint(equalTo: symbolPanel.topAnchor),
+            symbolScroll.leadingAnchor.constraint(equalTo: symbolPanel.leadingAnchor),
+            symbolScroll.trailingAnchor.constraint(equalTo: symbolPanel.trailingAnchor),
+            symbolScroll.bottomAnchor.constraint(equalTo: bar.topAnchor, constant: -6),
+            symbolGrid.topAnchor.constraint(equalTo: symbolScroll.contentLayoutGuide.topAnchor),
+            symbolGrid.bottomAnchor.constraint(equalTo: symbolScroll.contentLayoutGuide.bottomAnchor),
+            symbolGrid.leadingAnchor.constraint(equalTo: symbolScroll.contentLayoutGuide.leadingAnchor),
+            symbolGrid.trailingAnchor.constraint(equalTo: symbolScroll.contentLayoutGuide.trailingAnchor),
+            symbolGrid.widthAnchor.constraint(equalTo: symbolScroll.frameLayoutGuide.widthAnchor),
+            bar.leadingAnchor.constraint(equalTo: symbolPanel.leadingAnchor),
+            bar.trailingAnchor.constraint(equalTo: symbolPanel.trailingAnchor),
+            bar.bottomAnchor.constraint(equalTo: symbolPanel.bottomAnchor),
+            bar.heightAnchor.constraint(equalToConstant: 40),
+        ])
+        selectSymbolGroup(0)
+    }
+
+    private func selectSymbolGroup(_ index: Int) {
+        for (i, b) in symbolTabButtons.enumerated() {
+            b.backgroundColor = i == index ? .systemBackground : .systemGray3
+        }
+        symbolGrid.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        let items = symbolGroups[index].1
+        let perRow = index == 2 ? 6 : 7
+        var i = 0
+        while i < items.count {
+            var keys: [UIView] = []
+            for j in 0..<perRow {
+                if i + j < items.count {
+                    let sym = items[i + j]
+                    keys.append(makeKey(sym, font: .systemFont(ofSize: sym.count > 3 ? 12 : 19)) { [weak self] in
+                        self?.textDocumentProxy.insertText(sym)
+                    })
+                } else {
+                    let spacer = UIView()
+                    keys.append(spacer)
+                }
+            }
+            let r = row(keys)
+            r.heightAnchor.constraint(equalToConstant: 42).isActive = true
+            symbolGrid.addArrangedSubview(r)
+            i += perRow
+        }
+        symbolScroll.setContentOffset(.zero, animated: false)
+    }
+
+    private func showSymbols(_ show: Bool) {
+        if show, !digits.isEmpty, let first = candidates.first { commit(first) }
+        symbolPanel.isHidden = !show
+        if show { view.bringSubviewToFront(symbolPanel) }
     }
 
     private func setStatus(_ text: String) {
